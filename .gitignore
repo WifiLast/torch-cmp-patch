@@ -1,0 +1,12 @@
+# Machine-specific result of setup.py's opt-in conv3d tile autotuner
+# (CMPEXT3_AUTOTUNE=1) -- tied to whatever GPU produced it, not something
+# to commit.
+.cmpext3_autotune_cache.json
+
+# Build artifacts from `pip install -e .` / setup.py build_ext -- the compiled
+# extension is machine-specific (GPU arch, CUDA version, torch ABI) and gets
+# rebuilt from source, so it has no business in the repo.
+build/
+__pycache__/
+*.so
+*.egg-info/
