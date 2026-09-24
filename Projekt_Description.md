@@ -168,6 +168,128 @@ straight to the real build.
 - Force a fresh sweep, ignoring any cached result: `CMPEXT3_AUTOTUNE_FORCE=1 pip install -e . --no-build-isolation`
   (or just delete `.cmpext3_autotune_cache.json`)
 
+## Causal attention and RMSNorm (LLM-backbone support)
+
+Two gaps that only mattered for transformer/LLM-style models (as opposed to
+the conv-heavy diffusion UNets this project was originally built for) are
+now closed:
+
+- **`F.scaled_dot_product_attention(..., is_causal=True)`** used to be an
+  unconditional bail-to-stock in `_patched_sdpa` -- `fp16_attention.cu` had
+  no masking logic, only the plain (non-causal) case. Since an LLM-style
+  decoder (e.g. a Qwen3-backbone TTS model) calls SDPA with `is_causal=True`
+  on essentially every forward pass, cmpext3 never engaged for that
+  attention at all. Causal masking is now built into the kernel's tile loop
+  (per-block `causal_limit` early-exit + per-row/per-column masking in the
+  inner accumulation loop), ported from `sageattention`'s own
+  `turing_fma_free` fork of this exact kernel
+  (`other/amd_tools/source/sageattention-1.0.6/sageattention/csrc/
+  turing_fma_free/attention_fp16_turing.cu` -- a single-buffered version of
+  `fp16_attention.cu` that independently added causal masking for the same
+  reason: SageAttention's `sageattn()` exposes `is_causal`). Only the fp16,
+  head_dim=128 path supports it; the naive fp32 kernel and the optional
+  TensorRT attention engine still don't (`custom_attention_forward` raises /
+  skips them for a causal call rather than silently dropping the mask), so
+  a causal call on those falls back to stock SDPA exactly like an
+  unsupported shape does everywhere else in this file.
+- **`F.rms_norm`** is now patched (`_patched_rms_norm`), reusing the
+  `rmsnorm` native kernel that already existed in `src/main.cpp`/`ops.py`
+  for manual use but was never wired to the torch dispatch. RMSNorm (not
+  LayerNorm) is what Qwen3/Llama-family transformer blocks actually use, so
+  without this every norm in an LLM backbone was running on throttled stock
+  regardless of what else cmpext3 patched. `weight=None` falls back to stock
+  since the native kernel has no bias-free path (unlike `layer_norm`/
+  `group_norm`); every real transformer block supplies a weight anyway.
+
+Neither change touches `flash_attn`, `torch.nn.attention.flex_attention`, or
+a `flashinfer`-based attention/RMSNorm path -- those call their own CUDA
+extensions directly, bypassing `torch.nn.functional` entirely, so there is
+nothing for a monkeypatch to intercept. A model using those (e.g.
+`other/OmniVoice`'s `omnivoice_flashinfer.py` variant) only picks up the
+`F.linear`/`matmul`/`F.silu`/`F.embedding` speedups from this project, not
+attention or norm, regardless of the causal/RMSNorm work above -- covering
+that would mean patching or replacing those libraries' own kernels, not
+`torch.nn.functional`.
+
+## `cmpext3.rope_ops` / `cmpext3.fused_norm_ops` (opt-in Triton, LLM backbones)
+
+Two more manually-callable modules, for the same "no F.* stock op to
+monkeypatch" reason `cmpext3.ops.group_norm_silu` exists:
+
+- **`cmpext3.rope_ops.rotary_embedding(...)`** -- fused, in-place NeoX-style
+  RoPE application for query/key (any NeoX-style-RoPE model: Llama, Qwen,
+  Mistral, ...). Without this, a Qwen3-backbone model's own rotate-half RoPE
+  runs as several separate unfused elementwise ops (multiply, `cat`,
+  multiply, add) every token, every layer.
+- **`cmpext3.fused_norm_ops.fused_add_rms_norm(...)`** -- fuses the
+  `residual = residual + x; normed = rmsnorm(residual)` pre-norm epilogue
+  every decoder layer runs twice per layer into one kernel, on top of what
+  the plain `F.rms_norm` patch above already covers.
+
+Both are ports of `other/amd_tools/source/cmp_ext_turing/amd_tuned_torch/
+rope_ops.py` and `fused_norm_ops.py` -- written for RDNA3/ROCm, but the
+kernels themselves are plain `@triton.jit` Triton, no HIP/CK/CUDA-C, and
+Triton's CUDA backend is in fact the *original* one (ROCm support came
+later), so the port is close to line-for-line. Both carry a real backward
+pass (ported unchanged from upstream), so -- unlike every hand-written CUDA
+kernel in this project, which is forward-only and grad-gated off -- these
+work inside a training loop too.
+
+**Turing + bf16**: Triton's bf16 codegen needs ptxas sm_80+ (Ampere);
+below that (Turing/sm_75, i.e. every CMP card) it fails to compile at all
+-- the same wall documented in `other/amd_tools/source/sageattention-1.0.6/
+sageattention/_turing_compat.py` for SageAttention's own Triton kernels on
+this hardware. Both modules detect a sub-sm_80 device and work around it:
+`fused_add_rms_norm` (returns fresh tensors) simply upcasts bf16 to fp32
+for the kernel call and casts the outputs back; `rotary_embedding` (mutates
+query/key in place) upcasts, runs, and copies the fp32 result back into the
+original bf16 tensors -- and refuses that copy-back (raises rather than
+silently dropping gradients) when autograd is live, since the copy isn't
+gradient-tracked.
+
+Neither is imported by plain `import cmpext3` (Triton is not a hard
+dependency of this package) -- opt in explicitly with
+`import cmpext3.rope_ops` / `import cmpext3.fused_norm_ops` and check
+`.available()` first. **Unvalidated on real hardware** -- ported and
+syntax-checked but never run on an actual GPU (this environment has
+neither CUDA nor Triton installed); see
+`tests_hardware/test_triton_llm_ops.py` for the correctness/gradient
+checks to run before trusting either one.
+
+## `other/amd_tools`
+
+A separate project (ROCm kernel tuning for a Radeon RX 7900 XTX / RDNA3,
+`gfx1100`-only -- explicitly "not portable to CDNA or NVIDIA" per its own
+README) vendored under `other/amd_tools/source/`. It doesn't run on a CMP
+Turing card directly, but two of its vendored subtrees were directly useful
+as source material for the causal-attention work above:
+
+- `other/amd_tools/source/sageattention-1.0.6/` -- a fork of SageAttention
+  that already carries a **CMP-Turing-specific `turing_fma_free` CUDA
+  extension** (`sageattention/csrc/turing_fma_free/attention_fp16_turing.cu`
+  + `pybind.cpp`), auto-detected via `sageattention/_turing_compat.py`'s
+  `_is_turing_cmp_device()` (compute capability 7.5 + "CMP" in the device
+  name) and dispatched from `sageattention/cmp_patch.py`. Its kernel is a
+  single-buffered fork of this project's own `fp16_attention.cu` with
+  causal masking added -- exactly the missing piece ported into
+  `fp16_attention.cu` above. `_turing_compat.py` also documents a real
+  Triton `num_stages` pitfall on Turing worth knowing about independently:
+  Turing's 64KB/block shared-memory cap means SageAttention's hardcoded
+  `num_stages=4` for head_dim=128 overflows and fails to compile there;
+  `num_stages=2` is the confirmed-working value.
+- `other/amd_tools/source/xformers-0.0.27.post2/` -- referenced by this
+  project's own docstrings as another lineage that forked the same
+  FMA-free Turing kernel design; not separately mined for this change since
+  sageattention's fork already had the causal masking needed, but worth
+  checking for anything else (e.g. a memory-efficient-attention path) if
+  extending this further.
+- Everything else under `amd_tools/` -- `amd_tuned_torch/` itself, the
+  LoRA/LyCORIS training scripts, and `source/cmp_ext_turing/` +
+  `source/cmp_ext_turing_old/` (despite the name, a *different*, ROCm/HIP/
+  Composable-Kernel-based codebase -- `ck_conv_torch.cpp`,
+  `ck_gemm_torch.cpp`, etc. -- not a copy of this project) -- is
+  RDNA3/ROCm-specific and wasn't relevant to this NVIDIA-Turing change.
+
 # License
 
 MIT

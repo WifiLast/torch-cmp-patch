@@ -98,6 +98,8 @@ class TestEnableDisable:
         assert F.embedding is cmpext3._patched_embedding
         assert F.group_norm is cmpext3._patched_group_norm
         assert F.layer_norm is cmpext3._patched_layer_norm
+        if hasattr(F, "rms_norm"):
+            assert F.rms_norm is cmpext3._patched_rms_norm
         assert F.gelu.__name__ == "wrapper"
         assert F.silu.__name__ == "wrapper"
         assert F.softsign.__name__ == "wrapper"
@@ -751,7 +753,7 @@ class TestScaledDotProductAttention:
         native.attention.return_value = "native-result"
         got = F.scaled_dot_product_attention(q, k, v)
         assert got == "native-result"
-        assert_called_once_with_tensors(native.attention, q, k, v, None)
+        assert_called_once_with_tensors(native.attention, q, k, v, None, False)
 
     def test_falls_back_when_attn_mask_given(self, patched, native, monkeypatch):
         force_eligible(monkeypatch)
@@ -770,13 +772,22 @@ class TestScaledDotProductAttention:
         F.scaled_dot_product_attention(q, k, v, dropout_p=0.1)
         native.attention.assert_not_called()
 
-    def test_falls_back_when_is_causal(self, patched, native, monkeypatch):
+    def test_calls_native_when_is_causal(self, patched, native, monkeypatch):
+        # is_causal used to be an unconditional bail-to-stock: the native
+        # kernel had no masking logic, only the plain (non-causal) case.
+        # fp16_attention.cu now masks future keys in its tile loop (ported
+        # from sageattention's turing_fma_free fork of this kernel), so
+        # is_causal=True is passed through to the native call instead of
+        # forcing a stock fallback -- this is the path an LLM-style decoder
+        # (e.g. a Qwen3-backbone model) actually takes almost every call.
         force_eligible(monkeypatch)
         q = torch.randn(1, 2, 3, 4)
         k = torch.randn(1, 2, 3, 4)
         v = torch.randn(1, 2, 3, 4)
-        F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        native.attention.assert_not_called()
+        native.attention.return_value = "native-result"
+        got = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        assert got == "native-result"
+        assert_called_once_with_tensors(native.attention, q, k, v, None, True)
 
     def test_falls_back_on_non_4d_query(self, patched, native, monkeypatch):
         force_eligible(monkeypatch)
@@ -915,6 +926,63 @@ class TestLayerNorm:
         x = torch.randn(2, 3, 4)
         got = F.layer_norm(x, (4,))
         native.layer_norm.assert_called_once()
+        assert got.shape == x.shape
+
+
+_HAS_RMS_NORM = hasattr(F, "rms_norm")
+
+
+@pytest.mark.skipif(not _HAS_RMS_NORM, reason="torch build has no F.rms_norm")
+class TestRmsNorm:
+    def test_calls_native_with_normalized_shape_as_list(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        x = torch.randn(2, 3, 4)
+        w = torch.randn(4)
+        assert x.is_contiguous()
+        native.rmsnorm.return_value = "native-result"
+        got = F.rms_norm(x, (4,), w)
+        assert got == "native-result"
+        eps_val = torch.finfo(x.dtype).eps
+        assert_called_once_with_tensors(native.rmsnorm, x, [4], w, eps_val)
+
+    def test_passes_through_explicit_eps(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        x = torch.randn(2, 3, 4)
+        w = torch.randn(4)
+        native.rmsnorm.return_value = "native-result"
+        F.rms_norm(x, (4,), w, eps=1e-6)
+        assert_called_once_with_tensors(native.rmsnorm, x, [4], w, 1e-6)
+
+    def test_falls_back_when_weight_is_none(self, patched, native, monkeypatch):
+        # custom_rmsnorm_forward (src/main.cpp) has no weight=None path --
+        # unlike layer_norm/group_norm it always indexes into weight -- so a
+        # bias-free call must stay on stock rather than reach the kernel.
+        force_eligible(monkeypatch)
+        x = torch.randn(2, 3, 4)
+        F.rms_norm(x, (4,))
+        native.rmsnorm.assert_not_called()
+
+    def test_falls_back_on_non_contiguous_input(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        x = torch.randn(2, 3, 4).transpose(0, 1)
+        w = torch.randn(4)
+        assert not x.is_contiguous()
+        F.rms_norm(x, (4,), w)
+        native.rmsnorm.assert_not_called()
+
+    def test_falls_back_when_not_cuda(self, patched, native):
+        x = torch.randn(2, 3, 4)
+        w = torch.randn(4)
+        F.rms_norm(x, (4,), w)
+        native.rmsnorm.assert_not_called()
+
+    def test_falls_back_on_native_runtime_error(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        native.rmsnorm.side_effect = RuntimeError("boom")
+        x = torch.randn(2, 3, 4)
+        w = torch.randn(4)
+        got = F.rms_norm(x, (4,), w)
+        native.rmsnorm.assert_called_once()
         assert got.shape == x.shape
 
 
