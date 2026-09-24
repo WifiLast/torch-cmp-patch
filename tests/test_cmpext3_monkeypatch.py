@@ -395,6 +395,75 @@ class TestConv2d:
         assert got.shape == (1, 4, 8, 8)
 
 
+class TestConv2dFFT:
+    """Large-kernel conv2d routes to fftconv_ops.fft_conv2d instead of the
+    native CUDA kernel once weight's widest spatial axis crosses
+    CMPEXT3_FFTCONV2D_MIN_KERNEL (default 32) -- see cmpext3/__init__.py's
+    _fftconv_eligible/_FFTCONV2D_MIN_KERNEL."""
+
+    def test_small_kernel_still_uses_native_conv2d(self, patched, native, monkeypatch):
+        # Below the threshold: unaffected by this feature at all.
+        force_eligible(monkeypatch)
+        x = torch.randn(1, 3, 8, 8)
+        w = torch.randn(4, 3, 3, 3)
+        native.conv2d.return_value = "native-result"
+        got = F.conv2d(x, w, padding=1)
+        assert got == "native-result"
+        native.conv2d.assert_called_once()
+
+    def test_large_kernel_calls_fftconv_instead_of_native(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV2D_MIN_KERNEL", 5)
+        calls = []
+        monkeypatch.setattr(
+            cmpext3.fftconv_ops, "fft_conv2d",
+            lambda *a, **k: calls.append((a, k)) or "fft-result",
+        )
+        x = torch.randn(1, 2, 16, 16)
+        w = torch.randn(3, 2, 7, 7)
+        got = F.conv2d(x, w, padding=3)
+        assert got == "fft-result"
+        assert len(calls) == 1
+        native.conv2d.assert_not_called()
+
+    def test_large_kernel_falls_back_to_stock_when_fftconv_raises(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV2D_MIN_KERNEL", 5)
+        monkeypatch.setattr(
+            cmpext3.fftconv_ops, "fft_conv2d",
+            lambda *a, **k: (_ for _ in ()).throw(ValueError("kernel wider than input")),
+        )
+        x = torch.randn(1, 2, 16, 16)
+        w = torch.randn(3, 2, 7, 7)
+        got = F.conv2d(x, w, padding=3)
+        native.conv2d.assert_not_called()  # stock, not the small-kernel native tier
+        assert got.shape == (1, 3, 16, 16)
+
+    def test_disabled_via_env_falls_back_to_native_conv2d(self, patched, native, monkeypatch):
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV2D_ENABLED", False)
+        monkeypatch.setattr(cmpext3, "_FFTCONV2D_MIN_KERNEL", 5)
+        native.conv2d.return_value = "native-result"
+        x = torch.randn(1, 2, 16, 16)
+        w = torch.randn(3, 2, 7, 7)
+        got = F.conv2d(x, w, padding=3)
+        assert got == "native-result"
+
+    def test_string_padding_declines_fftconv_path(self, patched, native, monkeypatch):
+        # fft_conv only accepts int/tuple/"same" padding, same as the native
+        # kernel -- an unsupported padding string must not even try it.
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV2D_MIN_KERNEL", 5)
+        called = []
+        monkeypatch.setattr(cmpext3.fftconv_ops, "fft_conv2d",
+                            lambda *a, **k: called.append(1))
+        x = torch.randn(1, 2, 16, 16)
+        w = torch.randn(3, 2, 7, 7)
+        native.conv2d.return_value = "native-result"
+        got = F.conv2d(x, w, padding="valid")
+        assert got == "native-result"
+        assert not called
+
 
 # ---------------------------------------------------------------------------
 # cmpext3/autoselect.py -- the runtime native-vs-stock choice
@@ -629,6 +698,48 @@ class TestConv3d:
         got = F.conv3d(x, w, stride=(2, 4, 4))
         assert got == "native-result"
         assert_called_once_with_tensors(native.conv3d, x, w, None, (2, 4, 4), 0, 1, 1)
+
+
+class TestConv3dFFT:
+    """Large-kernel conv3d routes to fftconv_ops.fft_conv3d instead of the
+    native CUDA kernel (and skips the TensorRT/Winograd/direct contest
+    below it entirely) once weight's widest spatial axis crosses
+    CMPEXT3_FFTCONV3D_MIN_KERNEL (default 7) -- see cmpext3/__init__.py's
+    _fftconv_eligible/_FFTCONV3D_MIN_KERNEL."""
+
+    def test_small_kernel_still_uses_native_conv3d(self, patched_with_unverified_kernels, native, monkeypatch):
+        force_eligible(monkeypatch)
+        x = torch.randn(1, 3, 4, 8, 8)
+        w = torch.randn(4, 3, 2, 3, 3)
+        native.conv3d.return_value = "native-result"
+        got = F.conv3d(x, w, padding=1)
+        assert got == "native-result"
+        native.conv3d.assert_called_once()
+
+    def test_large_kernel_calls_fftconv_instead_of_native(self, patched_with_unverified_kernels, native, monkeypatch):
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV3D_MIN_KERNEL", 5)
+        calls = []
+        monkeypatch.setattr(
+            cmpext3.fftconv_ops, "fft_conv3d",
+            lambda *a, **k: calls.append((a, k)) or "fft-result",
+        )
+        x = torch.randn(1, 2, 8, 16, 16)
+        w = torch.randn(3, 2, 5, 5, 5)
+        got = F.conv3d(x, w, padding=2)
+        assert got == "fft-result"
+        assert len(calls) == 1
+        native.conv3d.assert_not_called()
+
+    def test_disabled_via_env_falls_back_to_native_conv3d(self, patched_with_unverified_kernels, native, monkeypatch):
+        force_eligible(monkeypatch)
+        monkeypatch.setattr(cmpext3, "_FFTCONV3D_ENABLED", False)
+        monkeypatch.setattr(cmpext3, "_FFTCONV3D_MIN_KERNEL", 5)
+        native.conv3d.return_value = "native-result"
+        x = torch.randn(1, 2, 8, 16, 16)
+        w = torch.randn(3, 2, 5, 5, 5)
+        got = F.conv3d(x, w, padding=2)
+        assert got == "native-result"
 
 
 # ---------------------------------------------------------------------------

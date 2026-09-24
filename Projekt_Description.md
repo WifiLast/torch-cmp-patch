@@ -290,6 +290,61 @@ as source material for the causal-attention work above:
   `ck_gemm_torch.cpp`, etc. -- not a copy of this project) -- is
   RDNA3/ROCm-specific and wasn't relevant to this NVIDIA-Turing change.
 
+## `cmpext3.fftconv_ops` (FFT convolution, large kernels)
+
+A third module ported from `other/amd_tools`, this time relevant to the
+project's *original* conv2d/conv3d use case (SDXL/video-diffusion), not
+the LLM-backbone work above: FFT-based convolution, for kernels too large
+for the hand-tuned direct/Winograd CUDA kernels in `src/cuda/` to be
+efficient at. Direct/im2col convolution is O(N*K) per spatial dim; FFT-conv
+is O(N log N) -- past some kernel width the algorithmic win outweighs the
+FFT/complex-multiply/inverse-FFT overhead.
+
+Ported from `other/amd_tools/source/cmp_ext_turing/amd_tuned_torch/
+fftconv_ops.py` (RDNA3/ROCm), but -- like `rope_ops`/`fused_norm_ops` above
+-- the actual algorithm is pure PyTorch (`torch.fft.rfftn`/`irfftn`,
+`F.pad`, `torch.kron`, `einsum`), so it isn't ROCm-specific: CUDA's
+`torch.fft` already goes through cuFFT, same as ROCm's goes through
+hipFFT. What was **not** ported: the ROCm-specific `rocfft_ops`/`vkfft_ops`
+routing (no CUDA equivalent need -- torch.fft on CUDA already calls cuFFT
+about as directly as a raw binding could), and the `kernel_select`-based
+"pad the FFT to a smoother length" contest (real optimization, but built
+entirely on amd_tuned_torch's own N-way measurement infrastructure, which
+doesn't exist in cmpext3 -- `cmpext3/autoselect.py` is a strict 2-way
+native-vs-stock chooser). `fft_conv` is still fully correct without it,
+just without that extra speedup -- see `cmpext3/fftconv_ops.py`'s own
+docstring for the full comparison.
+
+**Two ways to use it:**
+- **Directly**: `cmpext3.fftconv_ops.fft_conv1d/2d/3d/convnd(...)` --
+  `F.convNd`-shaped functions for a caller building a long-kernel layer
+  (Hyena-style global convolution, a long-kernel 1D audio/vocoder layer, a
+  large 3D kernel in a video-diffusion VAE) to call explicitly.
+- **Auto-patched**: `_patched_conv2d`/`_patched_conv3d` in
+  `cmpext3/__init__.py` route to `fftconv_ops.fft_conv{2,3}d` instead of
+  the native CUDA kernel once the kernel's widest spatial axis crosses
+  `CMPEXT3_FFTCONV2D_MIN_KERNEL` (default 32) / `CMPEXT3_FFTCONV3D_MIN_KERNEL`
+  (default 7) -- still measured against stock via the normal autoselect
+  contract, under a separate op name (`"conv2d_fft"`/`"conv3d_fft"`) so a
+  shape too small to win doesn't poison the small-kernel decision or vice
+  versa. `CMPEXT3_FFTCONV2D=0` / `CMPEXT3_FFTCONV3D=0` disables the
+  auto-patch path entirely (the direct functions are unaffected).
+
+Both threshold defaults are amd_tuned_torch's own **RDNA3** measurements,
+not a measurement on a CMP/Turing card -- treat them as starting points,
+not calibrated values, until re-measured on real hardware (there is no
+`fftconv_calibration.py`-equivalent persistence layer ported here either,
+for the same "no kernel_select to build on" reason as the smooth-length
+contest above).
+
+**UNVALIDATED ON A REAL CMP/TURING CARD**, same as every other port in this
+conversation: the algorithm itself is unchanged from upstream's own
+(independently tested) `fft-conv-pytorch` lineage, but the mixed-precision
+boundary and grouped/depthwise paths haven't been re-verified numerically
+or for speed here. See `tests_hardware/test_fftconv_ops.py` for the
+correctness checks (including the auto-patch actually engaging end to
+end) to run before trusting this for a real large-kernel workload.
+
 # License
 
 MIT

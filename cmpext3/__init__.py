@@ -169,6 +169,29 @@ See each module's own docstring for the Turing/bf16 caveat (Triton's bf16
 codegen needs ptxas sm_80+; both modules detect and work around it, one
 way for rope_ops' in-place mutation, another for fused_norm_ops' fresh-
 tensor return) and for how UNVALIDATED this port is on real hardware.
+
+cmpext3.fftconv_ops (fft_conv1d/2d/3d/convnd) is FFT-based convolution --
+the large-kernel counterpart to the small-kernel-tuned conv2d/conv3d CUDA
+kernels above, for a long-kernel 1D layer (audio/vocoder, Hyena-style
+global convolution) or a large 3D kernel (e.g. a video-diffusion VAE).
+Pure PyTorch (torch.fft/F.pad/torch.kron), no optional dependency, always
+available. It's both a manually-callable library (same posture as
+group_norm_silu above) AND wired into enable()'s conv2d/conv3d patches
+directly: once a kernel's widest spatial axis crosses
+CMPEXT3_FFTCONV2D_MIN_KERNEL (default 32) / CMPEXT3_FFTCONV3D_MIN_KERNEL
+(default 7), _patched_conv2d/_patched_conv3d dispatch against
+fftconv_ops.fft_conv{2,3}d instead of the native CUDA kernel, still
+measured against stock via the normal autoselect contract under a separate
+op name ("conv2d_fft"/"conv3d_fft"). Set CMPEXT3_FFTCONV2D=0 /
+CMPEXT3_FFTCONV3D=0 to disable. See cmpext3/fftconv_ops.py's own docstring
+for what was and wasn't ported from amd_tools's version (kept: the
+algorithm itself, including its mixed-precision fp32-transform-only
+policy; dropped: the ROCm-specific rocFFT/VkFFT routing and the
+kernel_select-based transform-length-smoothing contest, neither of which
+has a reason to exist -- or, for the latter, existing infrastructure to
+build on -- in this package) and for how unvalidated the port is on real
+hardware. The threshold defaults are amd_tuned_torch's own RDNA3
+measurements, not a measurement on a CMP/Turing card.
 """
 from __future__ import annotations
 
@@ -193,6 +216,7 @@ except ImportError as exc:  # pragma: no cover
 ops = _C
 
 from . import autoselect  # noqa: E402  (needs _C imported first)
+from . import fftconv_ops  # noqa: E402  -- pure PyTorch, no optional dependency to gate on
 
 _SUPPORTED_DTYPES = (torch.float16, torch.float32, torch.bfloat16)
 _ORIGINALS: dict[tuple[Any, str], Callable] = {}
@@ -242,6 +266,56 @@ _DISABLED_OPS = frozenset(
 # gets kernels switched on under them by upgrading.
 if os.environ.get("CMPEXT3_ENABLE_UNVERIFIED_KERNELS") in ("0", "false", "False"):
     _DISABLED_OPS = _DISABLED_OPS | frozenset({"conv3d", "conv_transpose2d", "interpolate"})
+
+
+# fftconv_ops.py large-kernel conv2d/conv3d integration (see that module's
+# docstring). Direct/im2col convolution is O(N*K) per spatial dim, FFT-conv
+# is O(N log N); the hand-tuned CUDA conv2d/conv3d kernels below are tuned
+# for small (3x3-style) kernels, so once a kernel's widest spatial axis
+# crosses these thresholds, _patched_conv2d/_patched_conv3d dispatch against
+# fftconv_ops.fft_conv{2,3}d instead of the native CUDA kernel -- still
+# measured against stock via the same autoselect contract, just under a
+# separate op name ("conv2d_fft"/"conv3d_fft") so a shape that's too small
+# to win doesn't poison the small-kernel "conv2d"/"conv3d" decision or vice
+# versa. Defaults (32 for 2D, 7 for 3D -- 3D crosses over far earlier than
+# 2D since a 3D kernel's element count grows with the cube of its width) are
+# amd_tuned_torch's own measured-on-RDNA3 starting points, NOT a measurement
+# on a CMP/Turing card -- override via these env vars once you have one:
+#   CMPEXT3_FFTCONV2D=0 / CMPEXT3_FFTCONV3D=0   disable the large-kernel path entirely
+#   CMPEXT3_FFTCONV2D_MIN_KERNEL / CMPEXT3_FFTCONV3D_MIN_KERNEL   override the threshold
+_FFTCONV2D_ENABLED = os.environ.get("CMPEXT3_FFTCONV2D", "1") not in ("0", "", "false", "False")
+_FFTCONV3D_ENABLED = os.environ.get("CMPEXT3_FFTCONV3D", "1") not in ("0", "", "false", "False")
+try:
+    _FFTCONV2D_MIN_KERNEL = int(os.environ.get("CMPEXT3_FFTCONV2D_MIN_KERNEL", "32"))
+except ValueError:
+    _FFTCONV2D_MIN_KERNEL = 32
+try:
+    _FFTCONV3D_MIN_KERNEL = int(os.environ.get("CMPEXT3_FFTCONV3D_MIN_KERNEL", "7"))
+except ValueError:
+    _FFTCONV3D_MIN_KERNEL = 7
+
+
+def _fftconv_eligible(weight: Any, min_kernel: int, padding: Any) -> bool:
+    """True if a conv call's kernel is wide enough, and its padding form
+    simple enough (fft_conv only accepts int/tuple/"same", same as the
+    native CUDA kernels below), to even try the FFT candidate."""
+    if isinstance(padding, str) and padding != "same":
+        return False
+    return max(weight.shape[2:]) >= min_kernel
+
+
+def _fft_conv_call(fn: Callable, *args, **kwargs):
+    """Runs an fftconv_ops.fft_conv{2,3}d call, joining its ValueError
+    (invalid padding string / kernel wider than input) with the
+    RuntimeError/TypeError cmpext3._dispatch already treats as "this
+    candidate doesn't support this call, use stock" -- fft_conv itself
+    raises ValueError for those cases (matching F.convNd), not
+    RuntimeError, so without this a genuinely-ineligible FFT call would
+    propagate instead of falling back."""
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _install(target: Any, name: str, wrapper: Callable) -> None:
@@ -345,6 +419,13 @@ def _patched_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, g
     orig = _ORIGINALS[(F, "conv2d")]
     if groups != 1 or not (_grad_safe(input, weight, bias) and _usable(input, weight)):
         return orig(input, weight, bias, stride, padding, dilation, groups)
+    if _FFTCONV2D_ENABLED and _fftconv_eligible(weight, _FFTCONV2D_MIN_KERNEL, padding):
+        return _dispatch("conv2d_fft", input,
+                         (input.shape, input.dtype, weight.shape, bias is not None,
+                          _hashable(stride), _hashable(padding), _hashable(dilation)),
+                         lambda: _fft_conv_call(fftconv_ops.fft_conv2d, input, weight, bias,
+                                                padding, "constant", stride, dilation, groups),
+                         lambda: orig(input, weight, bias, stride, padding, dilation, groups))
     return _dispatch("conv2d", input,
                      (input.shape, input.dtype, weight.shape, bias is not None,
                       _hashable(stride), _hashable(padding), _hashable(dilation)),
@@ -366,6 +447,20 @@ def _patched_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, g
     orig = _ORIGINALS[(F, "conv3d")]
     if groups != 1 or not (_grad_safe(input, weight, bias) and _usable(input, weight)):
         return orig(input, weight, bias, stride, padding, dilation, groups)
+
+    # Large-kernel path: bypasses the native-vs-Winograd-vs-TensorRT conv3d
+    # contest below entirely (those all target the small, fixed 3x3x3-ish
+    # kernels this project's CUDA kernels were written for) in favor of
+    # fftconv_ops.fft_conv3d, itself still measured against stock -- see
+    # _FFTCONV3D_MIN_KERNEL's own comment above for the threshold and why
+    # it's a separate autoselect op name ("conv3d_fft") from "conv3d".
+    if _FFTCONV3D_ENABLED and _fftconv_eligible(weight, _FFTCONV3D_MIN_KERNEL, padding):
+        return _dispatch("conv3d_fft", input,
+                         (input.shape, input.dtype, weight.shape, bias is not None,
+                          _hashable(stride), _hashable(padding), _hashable(dilation)),
+                         lambda: _fft_conv_call(fftconv_ops.fft_conv3d, input, weight, bias,
+                                                padding, "constant", stride, dilation, groups),
+                         lambda: orig(input, weight, bias, stride, padding, dilation, groups))
 
     def call_native():
         return _C.conv3d(input, weight, bias, stride, padding, dilation, groups)
