@@ -6,8 +6,7 @@ Tested on a CMP 50HX card with SDXL and Anima text-to-image models, at least tri
 
 ## What it does
 
-- Monkeypatches core `torch`/`F` ops (conv2d, conv3d, linear/matmul, attention, normalization including RMSNorm, activations, and more) with hand-tuned CUDA kernels that avoid the FMA throttle mining cards impose.
-- Attention supports causal masking (`is_causal=True`), so LLM-style decoder attention (e.g. a Qwen3/Llama-backbone model) is no longer forced to stock SDPA -- see `Projekt_Description.md` for the kernel/fallback details.
+- Monkeypatches core `torch`/`F` ops (conv2d, conv3d, linear/matmul, attention, normalization, activations, and more) with hand-tuned CUDA kernels that avoid the FMA throttle mining cards impose.
 - Supports FP16, FP32, and BF16. Turing has no native BF16 arithmetic, so BF16 tensors are converted at the kernel boundary and routed through the existing FMA-free FP32 or FP16 kernels.
 - Automatically selects, per operation and shape, whichever implementation (custom kernel or stock cuDNN/cuBLAS) is actually faster and numerically correct, measured at runtime rather than assumed in advance.
 - Uses a Winograd-based fp32 conv3d kernel where the shape allows it, chosen automatically against the direct kernel.

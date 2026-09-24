@@ -88,7 +88,7 @@ void launch_upsample_nearest_fp16(const void* input, void* output, int B, int C,
 // 输入: Q, K, V (B, H, S, D), Output (B, H, S, D)
 // 参数: B, H, S, D, scale
 void launch_attention_fp32(const float* q, const float* k, const float* v, float* output, int B, int H, int S, int D, float scale);
-void launch_attention_fp16(const void* q, const void* k, const void* v, void* output, int B, int H, int S, int D, float scale, bool causal);
+void launch_attention_fp16(const void* q, const void* k, const void* v, void* output, int B, int H, int S, int D, float scale);
 
 //GroupNorm
 // 参数: output, input, weight(gamma), bias(beta), N, C, HxW, groups, eps
@@ -1529,8 +1529,7 @@ torch::Tensor custom_attention_forward(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value,
-    c10::optional<double> scale_arg,
-    bool causal) {
+    c10::optional<double> scale_arg) {
 
     // bf16 has no native arithmetic on Turing; convert at the boundary and
     // reuse an existing FMA-free kernel. UNLIKE every other op in this
@@ -1547,7 +1546,7 @@ torch::Tensor custom_attention_forward(
     // round-tripping through this exact kernel design without overflow.
     if (query.scalar_type() == torch::kBFloat16) {
         torch::Tensor out = custom_attention_forward(
-            query.to(torch::kFloat16), key.to(torch::kFloat16), value.to(torch::kFloat16), scale_arg, causal);
+            query.to(torch::kFloat16), key.to(torch::kFloat16), value.to(torch::kFloat16), scale_arg);
         return out.to(torch::kBFloat16);
     }
 
@@ -1591,11 +1590,7 @@ torch::Tensor custom_attention_forward(
     // 3. 调度
 #ifdef CMPEXT3_WITH_TENSORRT
     bool attention_done_by_trt = false;
-    // The TensorRT Network-API attention engine (cmpext3_trt_attention_forward)
-    // was built for the plain, non-causal SDPA case -- same reason as the fp32
-    // kernel guard above. Skip it for a causal call and fall through to the
-    // fp16 causal-capable kernel below.
-    if (!causal && cmpext3_trt_enabled() &&
+    if (cmpext3_trt_enabled() &&
         (query.dtype() == torch::kFloat16 || query.dtype() == torch::kFloat32)) {
         bool is_fp16 = query.dtype() == torch::kFloat16;
         const void* q_ptr = is_fp16 ? (const void*)query.data_ptr<at::Half>() : (const void*)query.data_ptr<float>();
@@ -1609,14 +1604,6 @@ torch::Tensor custom_attention_forward(
     if (!attention_done_by_trt) {
 #endif
     if (query.dtype() == torch::kFloat32) {
-        // fp32_attention.cu (launch_attention_fp32) has no causal-masking
-        // logic -- it was only ever built for the non-causal SDPA case (see
-        // its own file header). Raise here rather than silently computing
-        // full (non-causal) attention under a caller that asked for causal:
-        // _patched_sdpa's except-RuntimeError-fall-back-to-stock contract
-        // in cmpext3/__init__.py turns this into a correct stock-SDPA call
-        // instead of a wrong answer.
-        TORCH_CHECK(!causal, "cmpext3 fp32 attention kernel does not support causal masking");
         launch_attention_fp32(
             query.data_ptr<float>(),
             key.data_ptr<float>(),
@@ -1647,7 +1634,7 @@ torch::Tensor custom_attention_forward(
             key.data_ptr<at::Half>(),
             value.data_ptr<at::Half>(),
             output.data_ptr<at::Half>(),
-            B, H, S, D, scale, causal
+            B, H, S, D, scale
         );
     } else {
         TORCH_CHECK(false, "Unsupported dtype for attention");
@@ -2240,8 +2227,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("query"),
           py::arg("key"),
           py::arg("value"),
-          py::arg("scale") = py::none(),
-          py::arg("causal") = false);
+          py::arg("scale") = py::none());
 
     // Embedding
     m.def("embedding", &custom_embedding_forward, "Custom Embedding Layer",

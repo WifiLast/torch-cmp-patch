@@ -138,8 +138,7 @@ __global__ void flash_attention_fp16_optimized(
     const half* __restrict__ V,
     half*       __restrict__ O,
     int B, int H, int S, int D,
-    half scale,
-    bool causal
+    half scale
 ) {
     // ------------------------------------------------------------------
     // Shared memory -- STAGES double-buffered K and V tiles
@@ -168,17 +167,6 @@ __global__ void flash_attention_fp16_optimized(
 
     const int  q_row  = blockIdx.x * TR + ty;
     const bool valid_q = (q_row < S);
-
-    // Causal: every row in this block lies in [blockIdx.x*TR, blockIdx.x*TR+TR-1],
-    // so no row needs a K/V tile that starts beyond the block's last row -- the
-    // tile loop can stop there. Per-row/per-column masking below (in the inner
-    // j-loop) handles the diagonal tile exactly. Ported from
-    // sageattention's turing_fma_free/attention_fp16_turing.cu (single-buffered
-    // fork of this kernel with causal masking added) -- see that file for the
-    // derivation.
-    const int block_last_row = min(blockIdx.x * TR + TR - 1, S - 1);
-    const int causal_limit   = block_last_row + 1;   // exclusive
-    const int effective_S    = causal ? min(S, causal_limit) : S;
 
     // ------------------------------------------------------------------
     // Register file
@@ -227,7 +215,7 @@ __global__ void flash_attention_fp16_optimized(
     //      prefetch, which writes to load_stage == this iteration's
     //      compute_stage (mod-2 aliasing again).
     // ------------------------------------------------------------------
-    const int num_tiles = (effective_S + TC - 1) / TC;
+    const int num_tiles = (S + TC - 1) / TC;
 
     if (num_tiles > 0) {
         // Prologue: fill stage 0 before the loop starts.
@@ -258,10 +246,6 @@ __global__ void flash_attention_fp16_optimized(
             const int valid_rows = min(TC, S - k_start);
 
             for (int j = 0; j < valid_rows; ++j) {
-
-                if (causal && (k_start + j) > q_row) {
-                    continue;   // future key -- masked out, contributes nothing
-                }
 
                 // ---- A. Dot product: score = (Q * scale) . K[j] ----
                 //
@@ -334,8 +318,7 @@ void launch_attention_fp16(
     int          H,
     int          S,
     int          D,
-    float        scale_f32,
-    bool         causal
+    float        scale_f32
 ) {
     if (D != D_DIM) return;
 
@@ -380,7 +363,7 @@ void launch_attention_fp16(
         static_cast<const half*>(v),
         static_cast<half*>(output),
         B, H, S, D,
-        scale_h, causal);
+        scale_h);
 
     //return cudaGetLastError();
 }
