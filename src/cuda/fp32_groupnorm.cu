@@ -93,10 +93,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
     float local_sum_sq = 0.0f;
 
     for (int c = 0; c < channels_per_group; ++c) {
-        const float* input_ptr = input + batch_offset + (c_start + c) * HxW;
+        int offset = batch_offset + (c_start + c) * HxW;
+        const float* input_ptr = input + offset;
 
+        // float4 loads below need `offset` aligned to 4 elements (16
+        // bytes). With num_groups == C (channels_per_group == 1, as in
+        // Wav2Vec2/HuBERT's GroupNorm conv layer) offset is
+        // n*C*HxW + g*HxW, whose alignment depends on g whenever HxW
+        // isn't a multiple of 4 -- reinterpret_cast<float4*> on an
+        // unaligned address is a misaligned CUDA access. Skip the
+        // vectorized range entirely in that case; the scalar remainder
+        // loop below then covers the whole channel.
+        bool can_vec4 = (offset % 4) == 0;
         int idx = threadIdx.x * 4;
-        int limit = (HxW / 4) * 4;
+        int limit = can_vec4 ? (HxW / 4) * 4 : 0;
 
         while (idx < limit) {
             float4 v = *reinterpret_cast<const float4*>(&input_ptr[idx]);
@@ -117,8 +127,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
             idx += blockDim.x * 4;
         }
 
-        idx = limit + threadIdx.x;
-        if (idx < HxW) {
+        // Strided, not a single `if`: when can_vec4 is false, limit is 0
+        // and this loop alone must cover the entire HxW channel.
+        for (idx = limit + threadIdx.x; idx < HxW; idx += blockDim.x) {
             float val = input_ptr[idx];
             local_sum = __fadd_rn(local_sum, val);
             local_sum_sq = __fadd_rn(local_sum_sq, __fmul_rn(val, val));
@@ -175,8 +186,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
         float scale = __fmul_rn(rstd, g_val);
         float shift = __fsub_rn(b_val, __fmul_rn(mean, scale));
 
+        bool can_vec4 = (offset % 4) == 0;
         int idx = threadIdx.x * 4;
-        int limit = (HxW / 4) * 4;
+        int limit = can_vec4 ? (HxW / 4) * 4 : 0;
 
         while (idx < limit) {
             float4 v = *reinterpret_cast<const float4*>(&input_ptr[idx]);
@@ -193,8 +205,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) GroupNormKernelFP32(
             idx += blockDim.x * 4;
         }
 
-        idx = limit + threadIdx.x;
-        if (idx < HxW) {
+        for (idx = limit + threadIdx.x; idx < HxW; idx += blockDim.x) {
             float val = input_ptr[idx];
             float normed = __fadd_rn(__fmul_rn(val, scale), shift);
             output_ptr[idx] = apply_silu ? gn_silu_scalar(normed) : normed;

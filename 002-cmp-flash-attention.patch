@@ -1,0 +1,600 @@
+diff --git a/ggml/src/ggml-cuda/fattn-cmp.cu b/ggml/src/ggml-cuda/fattn-cmp.cu
+new file mode 100644
+index 0000000..c365d27
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-cmp.cu
+@@ -0,0 +1,150 @@
++#include "common.cuh"
++#include "fattn-cmp.cuh"
++
++#include <cstdlib>
++#include <cstring>
++
++// Tri-state, mirroring how ollama treats flash attention itself:
++//   GGML_CUDA_FATTN_CMP = 1/on/true/yes  -> force the CMP kernel on
++//   GGML_CUDA_FATTN_CMP = 0/off/false/no -> force it off
++//   unset                                -> auto-detect an NVIDIA CMP card
++//
++// Auto-detection is by device name because there is nothing in the CUDA device
++// properties that distinguishes a throttled mining card from the GeForce part
++// it is cut from: a CMP 50HX reports the same compute capability 7.5 as a
++// regular TU102/TU116. Only the firmware differs.
++static int ggml_cuda_fattn_cmp_env() {
++    const char * s = getenv("GGML_CUDA_FATTN_CMP");
++    if (s == nullptr || s[0] == '\0') {
++        return -1; // auto
++    }
++    if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "false") || !strcmp(s, "no")) {
++        return 0;
++    }
++    return 1;
++}
++
++bool ggml_cuda_fattn_cmp_enabled(int device) {
++    static int  cached[GGML_CUDA_MAX_DEVICES];
++    static bool cached_valid[GGML_CUDA_MAX_DEVICES] = {};
++
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return false;
++    }
++    if (cached_valid[device]) {
++        return cached[device] != 0;
++    }
++
++    const int env = ggml_cuda_fattn_cmp_env();
++
++    bool enabled = false;
++    if (env == 0) {
++        enabled = false;
++    } else {
++        // The kernel's shared-memory budget and the packed-FP16 dot product
++        // assume Turing or newer.
++        const int cc = ggml_cuda_info().devices[device].cc;
++        const bool arch_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
++
++        if (env == 1) {
++            enabled = arch_ok;
++            if (!arch_ok) {
++                GGML_LOG_WARN("%s: GGML_CUDA_FATTN_CMP is set but device %d is not an NVIDIA Turing+ "
++                    "device, ignoring\n", __func__, device);
++            }
++        } else {
++            cudaDeviceProp prop;
++            const int physical_device = ggml_cuda_info().devices[device].physical_device;
++            if (arch_ok && cudaGetDeviceProperties(&prop, physical_device) == cudaSuccess) {
++                enabled = strstr(prop.name, "CMP ") != nullptr;
++                if (enabled) {
++                    GGML_LOG_INFO("%s: detected %s, using the FMA-free FlashAttention kernel "
++                        "(set GGML_CUDA_FATTN_CMP=0 to disable)\n", __func__, prop.name);
++                }
++            }
++        }
++    }
++
++    cached[device]       = enabled ? 1 : 0;
++    cached_valid[device] = true;
++    return enabled;
++}
++
++bool ggml_cuda_fattn_cmp_supported(const ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    // One head-size dispatch, and the per-lane half2 fragment layout needs
++    // D % 64 == 0. DKQ != DV (Deepseek, MiMo) is not handled.
++    if (K->ne[0] != V->ne[0] || Q->ne[0] != K->ne[0]) {
++        return false;
++    }
++    switch (Q->ne[0]) {
++        case 64:
++        case 128:
++        case 256:
++            break;
++        default:
++            return false;
++    }
++
++    // Decode is memory-bound rather than FMA-bound, so the throttle this kernel
++    // works around is not the bottleneck there; leave those shapes to the vec
++    // kernel, which already avoids tensor cores.
++    if (Q->ne[1] < 2) {
++        return false;
++    }
++
++    // The tile loader reads K/V 16 bytes at a time, so every row base it
++    // computes has to stay 16-byte aligned.
++    for (const ggml_tensor * t : {K, V}) {
++        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
++            if (t->nb[i] % 16 != 0) {
++                return false;
++            }
++        }
++    }
++    // Q is read as float2 and the mask as half.
++    if (Q->nb[1] % 8 != 0 || Q->nb[2] % 8 != 0 || Q->nb[3] % 8 != 0) {
++        return false;
++    }
++    if (mask && (mask->nb[1] % 2 != 0 || mask->nb[3] % 2 != 0)) {
++        return false;
++    }
++
++    return true;
++}
++
++template <int D>
++static void ggml_cuda_flash_attn_ext_cmp_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++
++    // One warp per query row, so ncols1 is both the queries per block and the
++    // warp count. 16 warps keeps a Turing SM half full at this shared-memory
++    // footprint; drop to 8 when there are not enough query rows to fill them.
++    if (Q->ne[1] <= 8) {
++        ggml_cuda_flash_attn_ext_cmp_case<D, 8>(ctx, dst);
++    } else {
++        ggml_cuda_flash_attn_ext_cmp_case<D, 16>(ctx, dst);
++    }
++}
++
++void ggml_cuda_flash_attn_ext_cmp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * K = dst->src[1];
++
++    switch (K->ne[0]) {
++        case  64:
++            ggml_cuda_flash_attn_ext_cmp_switch_ncols1< 64>(ctx, dst);
++            break;
++        case 128:
++            ggml_cuda_flash_attn_ext_cmp_switch_ncols1<128>(ctx, dst);
++            break;
++        case 256:
++            ggml_cuda_flash_attn_ext_cmp_switch_ncols1<256>(ctx, dst);
++            break;
++        default:
++            GGML_ABORT("unsupported head size for the CMP FlashAttention kernel");
++    }
++}
+diff --git a/ggml/src/ggml-cuda/fattn-cmp.cuh b/ggml/src/ggml-cuda/fattn-cmp.cuh
+new file mode 100644
+index 0000000..47b11ed
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-cmp.cuh
+@@ -0,0 +1,385 @@
++#include "common.cuh"
++#include "fattn-common.cuh"
++
++// ============================================================================
++// FlashAttention kernel for throttled NVIDIA CMP mining cards (Turing, TU10x).
++//
++// WHY THIS EXISTS
++//   CMP cards (50HX/90HX, compute capability 7.5) report turing_mma_available()
++//   == true, so ggml_cuda_get_best_fattn_kernel() routes them to the MMA path.
++//   Their firmware throttles exactly the two instruction classes that path is
++//   built on: tensor-core HMMA and FP32 FFMA. The result is a card with plenty
++//   of memory bandwidth that runs attention far below its nominal rate.
++//
++//   This kernel keeps the dominant O(S*D) Q.K^T work in packed FP16 arithmetic
++//   (HFMA2), which the firmware does not throttle, and is otherwise an ordinary
++//   tiled online-softmax FlashAttention kernel.
++//
++// PROVENANCE
++//   Derived from the fp16 attention kernel in torch-cmp-patch (cmpext3),
++//   src/cuda/fp16_attention.cu -- the TR x TC tiling, the STAGES=2 double
++//   buffered K/V staging, the int4 tile loader and the per-lane half2 fragment
++//   layout come from there. That kernel targets diffusion models: it has no
++//   mask, assumes one sequence length shared by Q/K/V, assumes MHA (no GQA),
++//   hardcodes D=128 and keeps the whole online softmax in FP16. None of that
++//   survives contact with LLM inference, so the following are new here:
++//
++//     - mask, ALiBi slope, logit_softcap and attention sinks
++//     - n_kv (ne11) decoupled from n_tokens (ne01), so decode and prefill work
++//     - grouped-query attention via head/gqa_ratio for the K/V heads
++//     - strided K/V access (nb11/nb21) instead of a packed [B][H][S][D] buffer
++//     - FP32 online-softmax state (m_i, l_i) and FP32 output accumulators
++//     - D in {64, 128, 256} instead of a hardcoded 128
++//     - the ggml parallel-block/dst_meta protocol so launch_fattn can split the
++//       KV range across blocks and combine the partial results
++//
++// NUMERICS
++//   The upstream kernel keeps m_i, l_i and the output accumulator in FP16 and
++//   its own note [N2] only claims that is safe to S ~ 1024. LLM contexts run
++//   far past that, so all softmax state here is FP32. FP16 survives in exactly
++//   one place: the per-lane Q.K^T products. Each lane accumulates only NP = D/64
++//   (at most 4) products in FP16 before the partial sums are converted to FP32
++//   for the warp reduction, so the FP16 accumulation depth is 4, not D. Q is
++//   pre-scaled so scores stay in a range FP16 represents comfortably.
++//
++//   The FP32 accumulator does mean the P.V update uses FFMA, which is throttled.
++//   That is a deliberate trade: correctness at long context over peak rate. The
++//   Q.K^T half, which is the part FP16 can do accurately here, stays unthrottled.
++// ============================================================================
++
++// Number of K/V rows staged in shared memory per tile. Chosen per head size so
++// that the double-buffered K+V staging stays under Turing's 48 KB
++// no-opt-in dynamic shared memory limit (see the static_assert below).
++static constexpr __device__ __host__ int ggml_cuda_fattn_cmp_get_TC(int D) {
++    return D <= 64 ? 64 : (D <= 128 ? 32 : 16);
++}
++
++// Double buffering: tile N+1's global load is issued before tile N's compute,
++// so load latency overlaps compute instead of serializing behind it. Set to 1
++// to A/B against a single-buffered build; the upstream kernel's note [N5] flags
++// this as an occupancy-vs-pipelining trade that has to be measured per GPU.
++#ifndef GGML_CUDA_FATTN_CMP_STAGES
++#define GGML_CUDA_FATTN_CMP_STAGES 2
++#endif // GGML_CUDA_FATTN_CMP_STAGES
++
++// Bank-conflict padding: 8 halves == 16 bytes, which also keeps every tile row
++// 16-byte aligned so the int4 loads below stay aligned.
++#define GGML_CUDA_FATTN_CMP_SMEM_PAD 8
++
++template <int D, int ncols1, bool use_logit_softcap>
++__launch_bounds__(WARP_SIZE*ncols1, 1)
++static __global__ void flash_attn_ext_cmp(
++        const char * Q_ptr,
++        const char * K_ptr,
++        const char * V_ptr,
++        const char * mask_ptr,
++        const char * sinks_ptr,
++        const int  * KV_max_ptr,
++        float      * dst_ptr,
++        float2     * dst_meta_ptr,
++        const float scale,
++        const float max_bias,
++        const float m0,
++        const float m1,
++        const uint32_t n_head_log2,
++        const float logit_softcap,
++        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
++                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
++        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
++                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
++                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
++                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
++                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++#ifdef FLASH_ATTN_AVAILABLE
++    const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
++    const char * GGML_CUDA_RESTRICT K        = K_ptr;
++    const char * GGML_CUDA_RESTRICT V        = V_ptr;
++    const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
++    const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
++    const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
++    float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
++    float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
++
++    constexpr int TC          = ggml_cuda_fattn_cmp_get_TC(D);
++    constexpr int STAGES      = GGML_CUDA_FATTN_CMP_STAGES;
++    constexpr int SMEM_STRIDE = D + GGML_CUDA_FATTN_CMP_SMEM_PAD;
++    constexpr int nthreads    = WARP_SIZE*ncols1;
++
++    // Half2 packs of the head dimension owned by each lane. Lane tx owns pack p
++    // at half2 index p*WARP_SIZE + tx, i.e. head-dim elements 2*(p*32+tx) and
++    // 2*(p*32+tx)+1. NP packs * 32 lanes * 2 halves == D.
++    constexpr int NP = D / (2*WARP_SIZE);
++    static_assert(D % (2*WARP_SIZE) == 0, "head size must be a multiple of 64");
++    static_assert(D % 8 == 0, "head size must be a multiple of the int4 load width");
++
++    constexpr size_t nbytes_smem = size_t(STAGES)*2*TC*SMEM_STRIDE*sizeof(half);
++    static_assert(nbytes_smem <= 48*1024,
++        "shared memory exceeds the 48 KB that needs no opt-in; lower TC or STAGES");
++
++    // 16-byte aligned because the tile loader below stores int4s into it.
++    extern __shared__ __align__(16) char smem_raw[];
++    half (*K_smem)[TC][SMEM_STRIDE] = (half (*)[TC][SMEM_STRIDE]) smem_raw;
++    half (*V_smem)[TC][SMEM_STRIDE] = (half (*)[TC][SMEM_STRIDE])
++        (smem_raw + size_t(STAGES)*TC*SMEM_STRIDE*sizeof(half));
++
++    const int tx  = threadIdx.x;               // lane within the warp
++    const int ty  = threadIdx.y;               // warp index == query row within the tile
++    const int tid = ty*WARP_SIZE + tx;
++
++    const int ic0 = blockIdx.x * ncols1;       // first Q column this block owns
++    const int ne01_val = int(ne01.z);
++
++    const int sequence  = blockIdx.z / ne02;
++    const int head      = blockIdx.z - sequence*ne02;
++    const int gqa_ratio = ne02 / ne12;         // > 1 under grouped-query attention
++
++    // One warp owns one query row for the whole kernel, so the online-softmax
++    // state below never has to be reduced across warps.
++    const int  q_row   = ic0 + ty;
++    const bool valid_q = q_row < ne01_val;
++
++    Q += nb03*sequence + nb02* head              + (size_t) nb01*q_row;
++    K += nb13*sequence + nb12*(head / gqa_ratio);
++    V += nb23*sequence + nb22*(head / gqa_ratio);
++
++    const half * maskh = mask ?
++        (const half *) (mask + nb33*(sequence % ne33) + (size_t) nb31*q_row) : nullptr;
++
++    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
++
++    // Online-softmax state, FP32. Warp-uniform: every lane reduces the same
++    // score, so m_i and l_i agree across the warp by construction.
++    float  m_i = -FLT_MAX/2.0f;
++    float  l_i = 0.0f;
++    half2  q_frag[NP];
++    float2 o_acc[NP];
++#pragma unroll
++    for (int p = 0; p < NP; ++p) {
++        q_frag[p] = make_half2(0.0f, 0.0f);
++        o_acc[p]  = make_float2(0.0f, 0.0f);
++    }
++
++    ggml_cuda_pdl_sync();
++
++    // Load Q and fold the softmax scale in here, so the FP16 dot products below
++    // see scores of order 1..30 rather than order sqrt(D) larger.
++    if (valid_q) {
++        const float2 * Q2 = (const float2 *) Q;
++#pragma unroll
++        for (int p = 0; p < NP; ++p) {
++            const float2 qv = Q2[p*WARP_SIZE + tx];
++            q_frag[p] = __floats2half2_rn(qv.x*scale, qv.y*scale);
++        }
++    }
++
++    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
++
++    // Stage a TC x D tile of K (or V) into shared memory. Block-wide: every
++    // thread participates regardless of whether its own query row is valid.
++    auto load_tile = [&](half dst_tile[TC][SMEM_STRIDE], const char * src, int k0) {
++        constexpr int packs_per_row = D / 8;         // one int4 == 8 halves
++#pragma unroll
++        for (int idx = tid; idx < TC*packs_per_row; idx += nthreads) {
++            const int row = idx / packs_per_row;
++            const int col = (idx % packs_per_row) * 8;
++            const int kv_row = k0 + row;
++
++            int4 val = make_int4(0, 0, 0, 0);
++            if (kv_row < k_VKQ_max) {
++                val = *(const int4 *) (src + (size_t) nb11*kv_row + col*sizeof(half));
++            }
++            *(int4 *) &dst_tile[row][col] = val;
++        }
++    };
++    // V uses the same row layout but its own row stride.
++    auto load_tile_V = [&](half dst_tile[TC][SMEM_STRIDE], const char * src, int k0) {
++        constexpr int packs_per_row = D / 8;
++#pragma unroll
++        for (int idx = tid; idx < TC*packs_per_row; idx += nthreads) {
++            const int row = idx / packs_per_row;
++            const int col = (idx % packs_per_row) * 8;
++            const int kv_row = k0 + row;
++
++            int4 val = make_int4(0, 0, 0, 0);
++            if (kv_row < k_VKQ_max) {
++                val = *(const int4 *) (src + (size_t) nb21*kv_row + col*sizeof(half));
++            }
++            *(int4 *) &dst_tile[row][col] = val;
++        }
++    };
++
++    // blockIdx.y splits the KV range across blocks; launch_fattn combines the
++    // partial results afterwards when gridDim.y > 1.
++    const int k_step  = gridDim.y*TC;
++    const int k_first = blockIdx.y*TC;
++
++    int stage = 0;
++    if (k_first < k_VKQ_max) {
++        load_tile  (K_smem[0], K, k_first);
++        load_tile_V(V_smem[0], V, k_first);
++    }
++    __syncthreads();
++
++    for (int k0 = k_first; k0 < k_VKQ_max; k0 += k_step) {
++        const int compute_stage = stage;
++        const int load_stage    = STAGES == 1 ? stage : (stage ^ 1);
++        const int k_next        = k0 + k_step;
++
++        // Prefetch the next tile into the other buffer before computing on this
++        // one. Safe without a barrier first because the two buffers are distinct
++        // (STAGES == 2); with STAGES == 1 the trailing barrier below orders it.
++        if (STAGES > 1 && k_next < k_VKQ_max) {
++            load_tile  (K_smem[load_stage], K, k_next);
++            load_tile_V(V_smem[load_stage], V, k_next);
++        }
++        if (STAGES > 1) {
++            __syncthreads();
++        }
++
++        if (valid_q) {
++            const int valid_rows = min(TC, k_VKQ_max - k0);
++
++            for (int j = 0; j < valid_rows; ++j) {
++                // ---- Q.K^T in packed FP16 (HFMA2, not throttled on CMP) ----
++                const half2 * krow = (const half2 *) K_smem[compute_stage][j];
++                half2 acc = __hmul2(q_frag[0], krow[tx]);
++#pragma unroll
++                for (int p = 1; p < NP; ++p) {
++                    acc = __hfma2(q_frag[p], krow[p*WARP_SIZE + tx], acc);
++                }
++                // Leave FP16 immediately: at most NP == 4 products accumulated.
++                float score = __half2float(acc.x) + __half2float(acc.y);
++                score = warp_reduce_sum(score);
++
++                if (use_logit_softcap) {
++                    score = logit_softcap*tanhf(score);
++                }
++                if (mask) {
++                    score += slope*__half2float(maskh[k0 + j]);
++                }
++
++                // ---- online softmax, FP32 ----
++                const float m_prev = m_i;
++                m_i = fmaxf(m_prev, score + FATTN_KQ_MAX_OFFSET);
++
++                const float alpha = expf(m_prev - m_i);
++                const float pw    = expf(score  - m_i);
++
++                l_i = l_i*alpha + pw;
++
++                // ---- P.V into FP32 accumulators ----
++                const half2 * vrow = (const half2 *) V_smem[compute_stage][j];
++#pragma unroll
++                for (int p = 0; p < NP; ++p) {
++                    const half2 vv = vrow[p*WARP_SIZE + tx];
++                    o_acc[p].x = o_acc[p].x*alpha + pw*__half2float(vv.x);
++                    o_acc[p].y = o_acc[p].y*alpha + pw*__half2float(vv.y);
++                }
++            }
++        }
++
++        // Protects this iteration's reads of compute_stage from the next
++        // iteration's prefetch, which (mod STAGES) writes the same buffer.
++        __syncthreads();
++
++        if (STAGES == 1 && k_next < k_VKQ_max) {
++            load_tile  (K_smem[0], K, k_next);
++            load_tile_V(V_smem[0], V, k_next);
++            __syncthreads();
++        }
++
++        stage = STAGES == 1 ? 0 : (stage ^ 1);
++    }
++
++    // Attention sinks contribute one extra logit to the denominator only; only
++    // the first KV split may apply it, or it would be counted once per block.
++    if (sinks && blockIdx.y == 0 && valid_q) {
++        const float sink  = ((const float *) sinks)[head];
++        const float m_new = fmaxf(sink, m_i);
++        const float alpha = expf(m_i - m_new);
++        m_i = m_new;
++
++        // l_i is already warp-complete here, so every lane adds the full term.
++        l_i = l_i*alpha + expf(sink - m_i);
++#pragma unroll
++        for (int p = 0; p < NP; ++p) {
++            o_acc[p].x *= alpha;
++            o_acc[p].y *= alpha;
++        }
++    }
++
++    if (valid_q) {
++        const size_t dst_row =
++            ((size_t(sequence)*ne01_val + q_row)*ne02 + head)*gridDim.y + blockIdx.y;
++
++#pragma unroll
++        for (int p = 0; p < NP; ++p) {
++            float2 o = o_acc[p];
++            if (gridDim.y == 1) {
++                // Single block owns the row, so normalise here; otherwise
++                // flash_attn_combine_results does it from dst_meta.
++                const float inv_l = 1.0f / l_i;
++                o.x *= inv_l;
++                o.y *= inv_l;
++            }
++            *(float2 *) &dst[dst_row*D + 2*(p*WARP_SIZE + tx)] = o;
++        }
++
++        if (gridDim.y != 1 && tx == 0) {
++            dst_meta[dst_row] = make_float2(m_i, l_i);
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++        max_bias, m0, m1, n_head_log2, logit_softcap,
++        ne00, ne01, ne02, ne03,
++              nb01, nb02, nb03,
++        ne10, ne11, ne12, ne13,
++              nb11, nb12, nb13,
++              nb21, nb22, nb23,
++              ne31, ne32, ne33,
++              nb31, nb32, nb33);
++    NO_DEVICE_CODE;
++#endif // FLASH_ATTN_AVAILABLE
++}
++
++template <int D, int ncols1, bool use_logit_softcap>
++static void ggml_cuda_flash_attn_ext_cmp_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    constexpr int TC          = ggml_cuda_fattn_cmp_get_TC(D);
++    constexpr int STAGES      = GGML_CUDA_FATTN_CMP_STAGES;
++    constexpr int SMEM_STRIDE = D + GGML_CUDA_FATTN_CMP_SMEM_PAD;
++    constexpr size_t nbytes_shared = size_t(STAGES)*2*TC*SMEM_STRIDE*sizeof(half);
++
++    fattn_kernel_t fattn_kernel = flash_attn_ext_cmp<D, ncols1, use_logit_softcap>;
++
++    // need_f16_K/V: launch_fattn converts a quantized or F32 KV cache to F16 for
++    // us, which is what the packed-FP16 dot product above requires.
++    // stream_k = false: this kernel reports partial results through dst_meta and
++    // relies on flash_attn_combine_results, like the vec kernel.
++    launch_fattn<D, ncols1, 1>(
++        ctx, dst, fattn_kernel, /*nwarps =*/ ncols1, nbytes_shared,
++        /*nbatch_fa =*/ TC, /*need_f16_K =*/ true, /*need_f16_V =*/ true,
++        /*stream_k =*/ false, /*use_sparse =*/ false);
++}
++
++template <int D, int ncols1>
++static void ggml_cuda_flash_attn_ext_cmp_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    float logit_softcap;
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++
++    if (logit_softcap == 0.0f) {
++        ggml_cuda_flash_attn_ext_cmp_case_impl<D, ncols1, false>(ctx, dst);
++    } else {
++        ggml_cuda_flash_attn_ext_cmp_case_impl<D, ncols1, true>(ctx, dst);
++    }
++}
++
++void ggml_cuda_flash_attn_ext_cmp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// Whether the CMP kernel is enabled for this device. Tri-state, mirroring how
++// ollama treats flash attention itself: GGML_CUDA_FATTN_CMP=1/on forces it on,
++// 0/off forces it off, and unset auto-detects an NVIDIA CMP mining card.
++bool ggml_cuda_fattn_cmp_enabled(int device);
++
++// Whether this particular op is one the CMP kernel can handle.
++bool ggml_cuda_fattn_cmp_supported(const ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ceb4727..cbed8f9 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "fattn-common.cuh"
++#include "fattn-cmp.cuh"
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+@@ -495,6 +496,8 @@ enum best_fattn_kernel {
+     BEST_FATTN_KERNEL_TILE    = 200,
+     BEST_FATTN_KERNEL_VEC     = 100,
+     BEST_FATTN_KERNEL_MMA_F16 = 400,
++    // FMA-free kernel for throttled NVIDIA CMP mining cards, see fattn-cmp.cuh.
++    BEST_FATTN_KERNEL_CMP     = 300,
+ };
+ 
+ // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
+@@ -610,6 +613,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
++    // CMP mining cards report turing_mma_available() == true but throttle both
++    // tensor cores and FP32 FFMA, so the MMA path below is a trap for them.
++    // Checked before it, and after the shape/type rejections above so that an
++    // op this kernel cannot handle still falls through to the normal choice.
++    if (ggml_cuda_fattn_cmp_enabled(device) && ggml_cuda_fattn_cmp_supported(dst)) {
++        return BEST_FATTN_KERNEL_CMP;
++    }
++
+     // If Turing tensor cores are available, use them:
+     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+         if (can_use_vector_kernel) {
+@@ -705,6 +716,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     switch (kernel) {
+         case BEST_FATTN_KERNEL_TILE:
+         case BEST_FATTN_KERNEL_MMA_F16:
++        case BEST_FATTN_KERNEL_CMP:
+             need_f16_K = true;
+             need_f16_V = true;
+             break;
+@@ -731,6 +743,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         case BEST_FATTN_KERNEL_TILE:
+             ggml_cuda_flash_attn_ext_tile(ctx, dst);
+             break;
++        case BEST_FATTN_KERNEL_CMP:
++            ggml_cuda_flash_attn_ext_cmp(ctx, dst);
++            break;
+         case BEST_FATTN_KERNEL_VEC:
+             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+             break;

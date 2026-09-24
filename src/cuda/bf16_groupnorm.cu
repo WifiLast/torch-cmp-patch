@@ -50,7 +50,16 @@ __global__ void GroupNormKernelBF16(
     // 向量化配置：int4 = 16 bytes = 8 x BF16
     int lane_idx = threadIdx.x;
     int stride = blockDim.x;
-    int vec_loop_end = num_elements_in_group & ~7; // 向下对齐到8
+    // int4 loads/stores below need (batch_offset + group_offset) aligned to
+    // 8 elements (16 bytes). With num_groups == C (channels_per_group == 1,
+    // as in Wav2Vec2/HuBERT's GroupNorm conv layer) that total offset is
+    // n*C*HxW + g*HxW, whose alignment depends on g whenever HxW isn't a
+    // multiple of 8 -- reinterpret_cast<int4*> on an unaligned address is a
+    // misaligned CUDA access, not just a missed optimization. When that's
+    // the case, skip the vectorized loop entirely (vec_loop_end = 0) and
+    // let the existing scalar remainder loop below cover every element.
+    bool can_vec8 = ((batch_offset + group_offset) % 8) == 0;
+    int vec_loop_end = can_vec8 ? (num_elements_in_group & ~7) : 0; // 向下对齐到8
 
     // 向量化循环
     for (int i = lane_idx * 8; i < vec_loop_end; i += stride * 8) {
