@@ -23,6 +23,20 @@ range (vs fp32/bf16) is an accepted tradeoff there since those ports
 already validated bf16->fp16->bf16 round-tripping through this exact
 kernel design without overflow.
 
+fp16_attention.cu's kernel supports causal masking (an `is_causal` call is
+no longer forced to stock -- see `_patched_sdpa` below), ported from
+sageattention's own turing_fma_free fork of this exact kernel
+(other/amd_tools/source/sageattention-1.0.6/sageattention/csrc/
+turing_fma_free/attention_fp16_turing.cu -- a single-buffered version of
+this file with causal masking added, built for the same reason: an LLM
+backbone calls SDPA with is_causal=True almost exclusively, and without
+this the whole attention stack of any transformer/LLM-style model --
+Qwen3, Llama, etc. -- fell straight through to throttled stock SDPA no
+matter what else cmpext3 patched). The fp32 kernel and the optional
+TensorRT attention engine still don't support it (see their guards in
+custom_attention_forward, src/main.cpp) and raise/skip rather than
+silently drop the mask.
+
 Import this package to enable the patch:
 
     import cmpext3   # patches torch/torch.nn.functional on import
@@ -137,6 +151,24 @@ padding=0, dilation=1 is pure channel-mixing with no spatial window at all,
 so it's reshaped to channels-last and dispatched straight to the tiled
 linear/matmul kernel instead of the conv windowing machinery, which would
 otherwise do real work for nothing.
+
+cmpext3.rope_ops.rotary_embedding(...) and
+cmpext3.fused_norm_ops.fused_add_rms_norm(...) are two more manually-callable
+(not monkeypatched -- no F.* stock op matches their calling convention)
+Triton kernels, for LLM-backbone models (e.g. a Qwen3/Llama-family TTS or
+text model) rather than diffusion UNets: fused RoPE application and a fused
+residual-add+RMSNorm pre-norm epilogue, respectively. Both are plain Triton
+(no CUDA-C, no HIP/CK), ported from other/amd_tools's RDNA3 tooling --
+Triton's CUDA backend is the original one, so despite that origin they are
+not ROCm-specific. Unlike this package's own hand-written CUDA kernels,
+both have real backward passes and so work under autograd, not just
+inference. Neither is imported by `import cmpext3` (triton is not a hard
+dependency of this package) -- `import cmpext3.rope_ops` /
+`import cmpext3.fused_norm_ops` explicitly, and check `.available()` first.
+See each module's own docstring for the Turing/bf16 caveat (Triton's bf16
+codegen needs ptxas sm_80+; both modules detect and work around it, one
+way for rope_ops' in-place mutation, another for fused_norm_ops' fresh-
+tensor return) and for how UNVALIDATED this port is on real hardware.
 """
 from __future__ import annotations
 
@@ -396,13 +428,26 @@ def _patched_interpolate(input, size=None, scale_factor=None, mode="nearest", **
 def _patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
                    scale=None, **kwargs):
     orig = _ORIGINALS[(F, "scaled_dot_product_attention")]
-    if (attn_mask is not None or dropout_p != 0.0 or is_causal
+    # attn_mask and dropout still have no kernel support (the native op takes
+    # no mask/dropout argument at all), so those still bail to stock. is_causal
+    # no longer does: _C.attention's fp16/D==128 path masks future keys inside
+    # the kernel itself (see src/cuda/fp16_attention.cu), ported from
+    # sageattention's turing_fma_free fork of this same kernel. This matters
+    # for LLM-style decoder attention (e.g. a Qwen3-backbone TTS model), which
+    # calls SDPA with is_causal=True almost exclusively -- previously every
+    # such call fell straight through to throttled stock SDPA and cmpext3
+    # never engaged for it at all. The fp32 kernel and the optional TensorRT
+    # engine still don't support causal masking (see the TORCH_CHECK/`!causal`
+    # guards in src/main.cpp); _dispatch's RuntimeError fallback below already
+    # covers a causal call landing on the unsupported fp32 path.
+    if (attn_mask is not None or dropout_p != 0.0
             or query.dim() != 4 or not _grad_safe(query, key, value)
             or not _usable(query, key, value)):
         return orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                      is_causal=is_causal, scale=scale, **kwargs)
-    return _dispatch("attention", query, (query.shape, query.dtype, key.shape, value.shape, scale),
-                     lambda: _C.attention(query, key, value, scale),
+    return _dispatch("attention", query,
+                     (query.shape, query.dtype, key.shape, value.shape, scale, is_causal),
+                     lambda: _C.attention(query, key, value, scale, is_causal),
                      lambda: orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                                   is_causal=is_causal, scale=scale, **kwargs))
 
@@ -441,6 +486,27 @@ def _patched_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-
                       weight is not None, bias is not None, eps),
                      lambda: _C.layer_norm(input, list(normalized_shape), weight, bias, eps),
                      lambda: orig(input, normalized_shape, weight, bias, eps))
+
+
+def _patched_rms_norm(input, normalized_shape, weight=None, eps=None):
+    orig = _ORIGINALS[(F, "rms_norm")]
+    # custom_rmsnorm_forward (src/main.cpp) requires a weight tensor of the
+    # same dtype as input to normalize against -- unlike layer_norm/group_norm
+    # it has no weight=None path, since a bias-free RMSNorm with weight=None
+    # is still routed through the kernel's TORCH_CHECK(weight.numel()==cols).
+    # RMSNorm without a learned scale is rare in practice (every transformer
+    # block here -- e.g. Qwen3RMSNorm -- always supplies one), so falling
+    # back to stock for that case costs nothing that mattered before.
+    if (weight is None or not input.is_contiguous()
+            or not (_grad_safe(input, weight) and _usable(input, weight))):
+        return orig(input, normalized_shape, weight, eps)
+    # F.rms_norm's eps=None means "use the dtype's default", exactly like
+    # layer_norm's hardcoded 1e-5 default above -- the native kernel takes an
+    # explicit double, so resolve None to the same default torch uses.
+    eps_val = eps if eps is not None else torch.finfo(input.dtype).eps
+    return _dispatch("rmsnorm", input, (input.shape, input.dtype, tuple(normalized_shape), eps),
+                     lambda: _C.rmsnorm(input, list(normalized_shape), weight, eps_val),
+                     lambda: orig(input, normalized_shape, weight, eps))
 
 
 # Keyword arguments each native (pybind11) elementwise op actually accepts,
@@ -523,6 +589,8 @@ def enable() -> None:
     _install(F, "embedding", _patched_embedding)
     _install(F, "group_norm", _patched_group_norm)
     _install(F, "layer_norm", _patched_layer_norm)
+    if hasattr(F, "rms_norm"):
+        _install(F, "rms_norm", _patched_rms_norm)
     _install(F, "gelu", _make_elementwise_patch("gelu", (F, "gelu")))
     _install(F, "silu", _make_elementwise_patch("silu", (F, "silu")))
     if hasattr(F, "mish"):
