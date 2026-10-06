@@ -235,13 +235,22 @@ def _mismatch(native_out: Any, stock_out: Any) -> str | None:
     if tuple(native_out.shape) != tuple(stock_out.shape):
         return f"shape {tuple(native_out.shape)} vs stock {tuple(stock_out.shape)}"
 
-    a = native_out.detach().float()
-    b = stock_out.detach().float()
-    if not torch.isfinite(a).all().item():
-        return "native output contains NaN/Inf"
-
-    diff = (a - b).abs().max().item()
-    scale = b.abs().max().item()
+    # Compared in chunks: full fp32 copies of both outputs plus their
+    # difference cost ~4x the output size in fp32, which ran a VAE decode at
+    # 512x1024 (128-channel full-resolution activations) out of memory on a
+    # 10 GB card in the middle of an otherwise fine generation.
+    a_flat = native_out.detach().reshape(-1)
+    b_flat = stock_out.detach().reshape(-1)
+    diff = 0.0
+    scale = 0.0
+    chunk = 1 << 22
+    for i in range(0, a_flat.numel(), chunk):
+        a = a_flat[i:i + chunk].float()
+        b = b_flat[i:i + chunk].float()
+        if not torch.isfinite(a).all().item():
+            return "native output contains NaN/Inf"
+        diff = max(diff, (a - b).abs_().max().item())
+        scale = max(scale, b.abs_().max().item())
     if not math.isfinite(diff):
         return "native output contains NaN/Inf"
     rel = diff / scale if scale > 0.0 else diff
@@ -310,6 +319,19 @@ def choose(op: str, key: Any, native_call: Callable, stock_call: Callable) -> An
                 return stock_call()
         return stock_call()
 
+    try:
+        return _probe(op, key, native_call, stock_call)
+    except torch.OutOfMemoryError:
+        # Probing holds both outputs (plus timing reruns) at once, so it can
+        # run out of memory where a single call would not. That says nothing
+        # about the kernel: serve this call from stock, record no decision,
+        # and probe again next time.
+        torch.cuda.empty_cache()
+        _probe_counts[op] = max(0, _probe_counts.get(op, 0) - 1)
+        return stock_call()
+
+
+def _probe(op: str, key: Any, native_call: Callable, stock_call: Callable) -> Any:
     _probe_counts[op] = _probe_counts.get(op, 0) + 1
 
     # Untimed warmup for both, which is also where an inapplicable shape or a
@@ -317,6 +339,8 @@ def choose(op: str, key: Any, native_call: Callable, stock_call: Callable) -> An
     # measurement.
     try:
         native_out = native_call()
+    except torch.OutOfMemoryError:
+        raise
     except (RuntimeError, TypeError) as exc:
         _record(key, op, False, note=f"native kernel raised {type(exc).__name__}: {exc}")
         return stock_call()

@@ -532,8 +532,12 @@ else:
 
 sources = [
     'src/cuda/fp16_matmul.cu',
+    # HFMA2 linear, the fp16 fast path (custom_linear_forward).
+    'src/cuda/fp16_linear_hfma2.cu',
     'src/cuda/fp32_matmul.cu',
     'src/cuda/fp16_conv.cu',
+    # HFMA2 implicit-GEMM conv2d, the fp16 fast path (custom_conv2d_forward).
+    'src/cuda/fp16_conv2d_hfma2.cu',
     'src/cuda/fp32_conv.cu',
     'src/cuda/fp16_conv3d.cu',
     'src/cuda/fp32_conv3d.cu',
@@ -552,6 +556,9 @@ sources = [
     'src/cuda/fp16_rmsnorm.cu',
     'src/cuda/fp32_rmsnorm.cu',
     'src/cuda/fp16_attention.cu',
+    # HFMA2 fused attention: arbitrary head_dim / cross-attention, the fast
+    # fp16 path (see custom_attention_forward in main.cpp).
+    'src/cuda/fp16_flash_attention_hfma2.cu',
     'src/cuda/fp32_attention.cu',
     #'src/cuda/fp16_upsample.cu',
     #'src/cuda/fp32_upsample.cu',

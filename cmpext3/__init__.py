@@ -324,7 +324,38 @@ def _install(target: Any, name: str, wrapper: Callable) -> None:
     key = (target, name)
     if key not in _ORIGINALS:
         _ORIGINALS[key] = getattr(target, name)
+    _keep_scriptable(wrapper, _ORIGINALS[key])
     setattr(target, name, wrapper)
+
+
+def _keep_scriptable(wrapper: Callable, original: Callable) -> None:
+    """Make torch.jit.script treat `wrapper` as the stock `original`.
+
+    TorchScript identifies torch.bmm & co. by object identity. Once a Python
+    wrapper replaces one, any scripted function calling it (kornia does this
+    at import) tries to compile the wrapper and dies on its `*, out=None`
+    signature. Scripted code therefore gets the stock op; eager calls still
+    go through the wrapper.
+    """
+    from torch.jit import _builtins, _state
+    op = _builtins._find_builtin(original)
+    if op is not None:
+        # A C++ builtin (torch.bmm -> aten::bmm): alias the wrapper to it.
+        _builtins._register_builtin(wrapper, op)
+        return
+    # A Python function (F.group_norm, ...): hand TorchScript the compiled
+    # original -- or, for one declared with @overload (F.interpolate), its
+    # compiled overloads, which TorchScript looks up instead. If the original
+    # does not script either, nothing changes.
+    from torch import _jit_internal
+    from torch.jit import _script
+    try:
+        if _jit_internal._get_fn_overloads(_jit_internal._qualified_name(original)):
+            _state._set_jit_overload_cache(wrapper, _script._get_overloads(original))
+        else:
+            _state._set_jit_function_cache(wrapper, torch.jit.script(original))
+    except Exception:
+        pass
 
 
 def _restore(target: Any, name: str) -> None:

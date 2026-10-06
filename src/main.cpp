@@ -11,6 +11,8 @@
 #include <string>
 #include <unordered_map>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #ifdef CMPEXT3_WITH_TENSORRT
 #include <c10/cuda/CUDAStream.h>
@@ -89,6 +91,21 @@ void launch_upsample_nearest_fp16(const void* input, void* output, int B, int C,
 // 参数: B, H, S, D, scale
 void launch_attention_fp32(const float* q, const float* k, const float* v, float* output, int B, int H, int S, int D, float scale);
 void launch_attention_fp16(const void* q, const void* k, const void* v, void* output, int B, int H, int S, int D, float scale, bool causal);
+// src/cuda/fp16_flash_attention_hfma2.cu -- HFMA2-only fused attention for
+// any head_dim in {40, 64, 80, 128, 160}, Sq != Sk, strided [B,H,S,D] views.
+// src/cuda/fp16_linear_hfma2.cu -- HFMA2 y = x W^T + b, no weight transpose.
+bool launch_linear_hfma2(const void* x, int64_t ldx, const void* w, const void* bias,
+                         void* y, int64_t ldy, int N, int M, int K, cudaStream_t stream);
+// src/cuda/fp16_conv2d_hfma2.cu -- HFMA2 implicit-GEMM conv2d, weights in
+// [Co][KH][KW][Ci] layout, fp32 accumulation between 64-channel chunks.
+bool launch_conv2d_hfma2(const void* x, const void* w_khwc, const void* bias, void* y,
+                         int N, int Ci, int H, int W, int Co, int KH, int KW,
+                         int sh, int sw, int ph, int pw, int dh, int dw, int Ho, int Wo,
+                         cudaStream_t stream);
+bool launch_flash_attention_hfma2(const void* q, const void* k, const void* v, void* o,
+                                  int B, int H, int Sq, int Sk, int D,
+                                  const int64_t* qs, const int64_t* ks, const int64_t* vs,
+                                  const int64_t* os, float scale, cudaStream_t stream);
 
 //GroupNorm
 // 参数: output, input, weight(gamma), bias(beta), N, C, HxW, groups, eps
@@ -207,6 +224,35 @@ torch::Tensor custom_linear_forward(
 
     long long total_elements = input.numel();
     int M = total_elements / K;
+
+    // HFMA2 linear (src/cuda/fp16_linear_hfma2.cu): 14-17 TFLOPS at SD1.5's
+    // shapes vs ~8 for the kernel below (which also re-transposes the weight
+    // on every call) and ~3 for stock cuBLAS. x and W are both read along K
+    // as they are, so no copies; fp32 accumulation every 64 K.
+    if (input.scalar_type() == torch::kFloat16 && weight.scalar_type() == torch::kFloat16 &&
+        input.is_cuda() && K % 8 == 0 && N % 8 == 0 && M > 0 &&
+        (!bias.has_value() || !bias->defined() || bias->scalar_type() == torch::kFloat16) &&
+        std::getenv("CMPEXT3_DISABLE_HFMA2_LINEAR") == nullptr) {
+        const c10::cuda::CUDAGuard guard(input.device());
+        torch::Tensor x2 = input.reshape({M, K});
+        if (x2.stride(1) != 1 || x2.stride(0) % 8 != 0 ||
+            (reinterpret_cast<uintptr_t>(x2.data_ptr()) % 16) != 0) {
+            x2 = x2.contiguous();
+        }
+        torch::Tensor w = weight.contiguous();
+        torch::Tensor b;
+        if (bias.has_value() && bias->defined()) b = bias->contiguous();
+        if ((reinterpret_cast<uintptr_t>(w.data_ptr()) % 16) == 0) {
+            std::vector<int64_t> out_shape = input.sizes().vec();
+            out_shape.back() = N;
+            torch::Tensor y = torch::empty(out_shape, input.options());
+            if (launch_linear_hfma2(x2.data_ptr(), x2.stride(0), w.data_ptr(),
+                                    b.defined() ? b.data_ptr() : nullptr, y.data_ptr(), N,
+                                    M, N, K, c10::cuda::getCurrentCUDAStream(input.device().index()).stream())) {
+                return y;
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // 关键修正 1: 权重转置
@@ -445,6 +491,35 @@ torch::Tensor custom_conv2d_forward(
     int p_w = padding.size() > 1 ? padding[1] : padding[0];
     int d_h = dilation[0];
     int d_w = dilation.size() > 1 ? dilation[1] : dilation[0];
+
+    // HFMA2 implicit-GEMM conv (src/cuda/fp16_conv2d_hfma2.cu): ~11-12 TFLOPS
+    // at SD1.5's shapes vs ~5 for the kernels below and ~2-3 for stock cuDNN,
+    // and its fp32 accumulation between 64-channel chunks keeps the error at
+    // ~7e-4 relative (the fp16-accumulating kernel below fails autoselect's
+    // check on some shapes). With only a handful of input channels (e.g. a
+    // UNet's 4-channel conv_in) most of each 64-channel chunk is padding and
+    // the older kernel wins, so those stay below.
+    if (input.scalar_type() == torch::kFloat16 && weight.scalar_type() == torch::kFloat16 &&
+        groups == 1 && C_in >= 16 && input.is_cuda() &&
+        (!bias.has_value() || !bias->defined() || bias->scalar_type() == torch::kFloat16) &&
+        std::getenv("CMPEXT3_DISABLE_HFMA2_CONV") == nullptr) {
+        const int H_out_h = (H_in + 2 * p_h - d_h * (K_H - 1) - 1) / s_h + 1;
+        const int W_out_h = (W_in + 2 * p_w - d_w * (K_W - 1) - 1) / s_w + 1;
+        if (H_out_h > 0 && W_out_h > 0) {
+            const c10::cuda::CUDAGuard guard(input.device());
+            torch::Tensor x = input.contiguous();
+            torch::Tensor w_khwc = weight.permute({0, 2, 3, 1}).contiguous();
+            torch::Tensor b;
+            if (bias.has_value() && bias->defined()) b = bias->contiguous();
+            torch::Tensor y = torch::empty({B, C_out, H_out_h, W_out_h}, input.options());
+            if (launch_conv2d_hfma2(x.data_ptr(), w_khwc.data_ptr(), b.defined() ? b.data_ptr() : nullptr,
+                                    y.data_ptr(), B, C_in, H_in, W_in, C_out, K_H, K_W,
+                                    s_h, s_w, p_h, p_w, d_h, d_w, H_out_h, W_out_h,
+                                    c10::cuda::getCurrentCUDAStream(input.device().index()).stream())) {
+                return y;
+            }
+        }
+    }
 
     // =========================================================================
     // 优化分支: 1x1 Convolution 优化
@@ -1549,6 +1624,45 @@ torch::Tensor custom_attention_forward(
         torch::Tensor out = custom_attention_forward(
             query.to(torch::kFloat16), key.to(torch::kFloat16), value.to(torch::kFloat16), scale_arg, causal);
         return out.to(torch::kBFloat16);
+    }
+
+    // HFMA2 fused attention (src/cuda/fp16_flash_attention_hfma2.cu): the fast
+    // path for fp16, non-causal SDPA. On the CMP 50HX the tensor cores are
+    // throttled to ~3.3 TFLOPS while HFMA2 runs at ~26, and this kernel is
+    // 2-5x faster than stock SDPA at SD1.5's shapes. It also covers what the
+    // kernel below cannot: head_dim other than 128 and cross-attention
+    // (Sk != Sq). It reads strided [B,H,S,D] views as they come (only the last
+    // dim must be contiguous) and returns a [B,H,Sq,D] view of [B,Sq,H,D]
+    // memory, which is the layout the caller transposes back to anyway.
+    if (!causal && query.scalar_type() == torch::kFloat16 && query.dim() == 4 &&
+        key.dim() == 4 && value.dim() == 4 &&
+        key.scalar_type() == torch::kFloat16 && value.scalar_type() == torch::kFloat16) {
+        const int64_t B_ = query.size(0), H_ = query.size(1), Sq_ = query.size(2), D_ = query.size(3);
+        const int64_t Sk_ = key.size(2);
+        auto aligned_rows = [](const torch::Tensor& t) {
+            return t.stride(3) == 1 && t.stride(0) % 8 == 0 && t.stride(1) % 8 == 0 &&
+                   t.stride(2) % 8 == 0 && (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16) == 0;
+        };
+        bool shapes_ok = key.size(0) == B_ && key.size(1) == H_ && key.size(3) == D_ &&
+                         value.size(0) == B_ && value.size(1) == H_ && value.size(2) == Sk_ &&
+                         value.size(3) == D_ && Sq_ > 0 && Sk_ > 0 &&
+                         query.device() == key.device() && query.device() == value.device();
+        if (shapes_ok && D_ % 8 == 0 && aligned_rows(query) && aligned_rows(key) && aligned_rows(value)) {
+            float scale_f = scale_arg.has_value() ? (float)scale_arg.value() : 1.0f / std::sqrt((float)D_);
+            torch::Tensor out = torch::empty({B_, Sq_, H_, D_}, query.options()).transpose(1, 2);
+            int64_t qs[3] = {query.stride(0), query.stride(1), query.stride(2)};
+            int64_t ks[3] = {key.stride(0), key.stride(1), key.stride(2)};
+            int64_t vs[3] = {value.stride(0), value.stride(1), value.stride(2)};
+            int64_t os[3] = {out.stride(0), out.stride(1), out.stride(2)};
+            const c10::cuda::CUDAGuard guard(query.device());
+            if (launch_flash_attention_hfma2(
+                    query.data_ptr(), key.data_ptr(), value.data_ptr(), out.data_ptr(),
+                    (int)B_, (int)H_, (int)Sq_, (int)Sk_, (int)D_, qs, ks, vs, os, scale_f,
+                    c10::cuda::getCurrentCUDAStream(query.device().index()).stream())) {
+                return out;
+            }
+            // unsupported head_dim: fall through to the kernels below
+        }
     }
 
     // 1. 基础检查
