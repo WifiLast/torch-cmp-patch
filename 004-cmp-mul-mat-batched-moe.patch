@@ -1,0 +1,183 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 710610a8c..5f73277e4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1896,6 +1896,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+         }
+     }
+ 
++    if (ggml_cuda_mul_mat_id_cmp_wanted(ggml_cuda_get_device(), dst)) {
++        return true;
++    }
++
+     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+         return false;
+     }
+@@ -1937,12 +1941,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+             }
+         }
+ 
+-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
++        // CMP mining cards: skip the throttled MMQ/MMF kernels, the per-expert fallback below
++        // reaches ggml_cuda_mul_mat_cmp. See mmcmp.cuh.
++        const bool use_cmp = ggml_cuda_mul_mat_id_cmp_wanted(ctx.device, dst);
++
++        if (!use_cmp && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+             return;
+         }
+ 
+-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
++        if (!use_cmp && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+             return;
+         }
+diff --git a/ggml/src/ggml-cuda/mmcmp.cu b/ggml/src/ggml-cuda/mmcmp.cu
+index 475dc8fb1..01e0c8980 100644
+--- a/ggml/src/ggml-cuda/mmcmp.cu
++++ b/ggml/src/ggml-cuda/mmcmp.cu
+@@ -24,13 +24,24 @@ __device__ __forceinline__ void cmp_hfma2_dot8(half2 & acc, const int4 & a, cons
+ }
+ 
+ // Y[n][m] = sum_k X[n][k] * W[m][k]     (ggml: dst = src0^T . src1)
+-// X: [N][K] F16, row stride ldx. W: [M][K] F16 contiguous. Y: [N][M] F32, row stride ldy.
++// X: [N][K] F16, row stride ldx. W: [M][K] F16, row stride ldw. Y: [N][M] F32, row stride ldy.
++// Batched over blockIdx.z = i12 + ne12*i13 (ne12 x ne13 matrices of X and Y, contiguous per matrix).
++// W is broadcast: matrix (i12/r2, i13/r3) with element strides sw2/sw3.
+ static __global__ void __launch_bounds__(CMP_NT, 2) mul_mat_cmp_hfma2(
+         const half * __restrict__ X, const int64_t ldx,
+-        const half * __restrict__ W,
++        const half * __restrict__ W, const int64_t ldw, const int64_t sw2, const int64_t sw3,
+         float      * __restrict__ Y, const int64_t ldy,
+-        const int N, const int M, const int K) {
++        const int N, const int M, const int K,
++        const int ne12, const int r2, const int r3) {
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
++    {
++        const int i12 = blockIdx.z % ne12;
++        const int i13 = blockIdx.z / ne12;
++        X += (int64_t) blockIdx.z*N*ldx;
++        Y += (int64_t) blockIdx.z*N*ldy;
++        W += (i12/r2)*sw2 + (i13/r3)*sw3;
++    }
++
+     __shared__ __align__(16) half As[CMP_BM*CMP_LDS];
+     __shared__ __align__(16) half Bs[CMP_BN*CMP_LDS];
+ 
+@@ -55,7 +66,7 @@ static __global__ void __launch_bounds__(CMP_NT, 2) mul_mat_cmp_hfma2(
+             const int c = (i % (CMP_CK/8))*8;
+             int4 v = make_int4(0, 0, 0, 0);
+             if (m0 + r < M && k0 + c < K) {
+-                v = *reinterpret_cast<const int4 *>(W + (int64_t)(m0 + r)*K + k0 + c);
++                v = *reinterpret_cast<const int4 *>(W + (int64_t)(m0 + r)*ldw + k0 + c);
+             }
+             *reinterpret_cast<int4 *>(As + r*CMP_LDS + c) = v;
+         }
+@@ -129,7 +140,7 @@ static __global__ void __launch_bounds__(CMP_NT, 2) mul_mat_cmp_hfma2(
+         }
+     }
+ #else
+-    GGML_UNUSED_VARS(X, ldx, W, Y, ldy, N, M, K);
++    GGML_UNUSED_VARS(X, ldx, W, ldw, sw2, sw3, Y, ldy, N, M, K, ne12, r2, r3);
+     NO_DEVICE_CODE;
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+ }
+@@ -205,11 +216,20 @@ bool ggml_cuda_mul_mat_cmp_supported(const ggml_tensor * src0, const ggml_tensor
+     if (src0->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(src0->type) == nullptr) {
+         return false;
+     }
+-    // Plain 2D weights; batched/broadcast matmuls (attention without FA, MoE slices) are left alone.
+-    if (ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1) {
++    // Matrices are batched over dims 2/3 and src0 is broadcast over src1 (ne12 % ne02, ne13 % ne03).
++    if (ne12 % ne02 != 0 || ne13 % ne03 != 0 || ne12*ne13 > 65535) {
++        return false;
++    }
++    // K must be contiguous with 16 B aligned rows in src0 (a transposed V cache is not), and src1/dst
++    // rows contiguous. Quantized src0 is dequantized wholesale, so it has to be fully contiguous.
++    if (ggml_is_quantized(src0->type)) {
++        if (!ggml_is_contiguous(src0)) {
++            return false;
++        }
++    } else if (nb00 != sizeof(half) || nb01 % 16 != 0 || nb02 % 16 != 0 || nb03 % 16 != 0) {
+         return false;
+     }
+-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++    if (nb10 != sizeof(float) || !ggml_is_contiguous(dst)) {
+         return false;
+     }
+     // Single-token decode is memory bound, not FMA bound; MMVQ/MMVF already serve it.
+@@ -233,24 +253,57 @@ void ggml_cuda_mul_mat_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     cudaStream_t stream = ctx.stream();
+ 
+     const half * w_ptr = (const half *) src0->data;
++    int64_t ldw = nb01/sizeof(half);
++    int64_t sw2 = nb02/sizeof(half);
++    int64_t sw3 = nb03/sizeof(half);
+     ggml_cuda_pool_alloc<half> w_alloc(ctx.pool());
+     if (src0->type != GGML_TYPE_F16) {
+         w_alloc.alloc(ggml_nelements(src0));
+         const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
+         to_fp16(src0->data, w_alloc.get(), ggml_nelements(src0), stream);
+         w_ptr = w_alloc.get();
++        ldw = ne00;
++        sw2 = ne00*ne01;
++        sw3 = sw2*ne02;
+     }
+ 
++    // Activations to packed F16, [ne13][ne12][ne11][ne10], whatever the source strides were.
+     ggml_cuda_pool_alloc<half> x_alloc(ctx.pool(), ggml_nelements(src1));
+-    const to_fp16_cuda_t to_fp16_f32 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+-    to_fp16_f32(src1->data, x_alloc.get(), ggml_nelements(src1), stream);
++    if (ggml_is_contiguous(src1)) {
++        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
++        to_fp16(src1->data, x_alloc.get(), ggml_nelements(src1), stream);
++    } else {
++        const to_fp16_nc_cuda_t to_fp16_nc = ggml_get_to_fp16_nc_cuda(GGML_TYPE_F32);
++        to_fp16_nc(src1->data, x_alloc.get(), ne10, ne11, ne12, ne13,
++            nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float), stream);
++    }
+ 
+     const int N = (int) ne11;
+     const int M = (int) ne01;
+     const int K = (int) ne00;
+ 
+-    const dim3 grid((N + CMP_BN - 1)/CMP_BN, (M + CMP_BM - 1)/CMP_BM);
++    const dim3 grid((N + CMP_BN - 1)/CMP_BN, (M + CMP_BM - 1)/CMP_BM, (unsigned) (ne12*ne13));
+     mul_mat_cmp_hfma2<<<grid, CMP_NT, 0, stream>>>(
+-        x_alloc.get(), K, w_ptr, (float *) dst->data, ne0, N, M, K);
++        x_alloc.get(), K, w_ptr, ldw, sw2, sw3, (float *) dst->data, ne0, N, M, K,
++        (int) ne12, (int) (ne12/ne02), (int) (ne13/ne03));
+     CUDA_CHECK(cudaGetLastError());
+ }
++
++bool ggml_cuda_mul_mat_id_cmp_wanted(int device, const ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++
++    if (!ggml_cuda_mul_mat_cmp_enabled(device)) {
++        return false;
++    }
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_quantized(src0->type)) {
++        return false;
++    }
++    if (ggml_get_to_fp16_cuda(src0->type) == nullptr || !ggml_is_contiguous(src0)) {
++        return false;
++    }
++    if (src0->ne[0] % 8 != 0 || src0->ne[1] % 8 != 0) {
++        return false;
++    }
++    return src1->ne[2] >= 32;
++}
+diff --git a/ggml/src/ggml-cuda/mmcmp.cuh b/ggml/src/ggml-cuda/mmcmp.cuh
+index 509094db9..b61900a97 100644
+--- a/ggml/src/ggml-cuda/mmcmp.cuh
++++ b/ggml/src/ggml-cuda/mmcmp.cuh
+@@ -29,3 +29,8 @@ bool ggml_cuda_mul_mat_cmp_enabled(int device);
+ bool ggml_cuda_mul_mat_cmp_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ 
+ void ggml_cuda_mul_mat_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++
++// Whether a mul_mat_id (MoE) should leave MMQ/MMF and use the per-expert fallback, whose slices
++// then reach ggml_cuda_mul_mat_cmp. Needs enough tokens that experts see 8+ rows each; quantized
++// experts only (F16 experts are fed to the slices as F16 activations, which the CMP path does not take).
++bool ggml_cuda_mul_mat_id_cmp_wanted(int device, const ggml_tensor * dst);
