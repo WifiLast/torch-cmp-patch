@@ -1,0 +1,325 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5ae3b8d22..710610a8c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -29,6 +29,7 @@
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
++#include "ggml-cuda/mmcmp.cuh"
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+@@ -1830,6 +1831,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         return;
+     }
+ 
++    // Throttled CMP mining cards: tensor cores and FP32 FFMA are firmware-limited, so every
++    // stock dense path below (MMQ, MMF, cuBLAS) is slow. Use the HFMA2 GEMM, see mmcmp.cuh.
++    if (ggml_cuda_mul_mat_cmp_enabled(ctx.device) && ggml_cuda_mul_mat_cmp_supported(src0, src1, dst)) {
++        ggml_cuda_mul_mat_cmp(ctx, src0, src1, dst);
++        return;
++    }
++
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
+diff --git a/ggml/src/ggml-cuda/mmcmp.cu b/ggml/src/ggml-cuda/mmcmp.cu
+new file mode 100644
+index 000000000..475dc8fb1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmcmp.cu
+@@ -0,0 +1,256 @@
++#include "mmcmp.cuh"
++#include "convert.cuh"
++
++#include <cstdlib>
++#include <cstring>
++
++namespace {
++
++constexpr int CMP_BM  = 64;  // output features per block
++constexpr int CMP_BN  = 128; // activation rows per block
++constexpr int CMP_CK  = 64;  // K elements per shared-memory stage
++constexpr int CMP_NT  = 256;
++constexpr int CMP_TM  = 8;   // features per thread
++constexpr int CMP_TN  = 4;   // rows per thread
++constexpr int CMP_LDS = CMP_CK + 8; // 144 B rows: odd number of 16 B chunks, conflict free
++
++__device__ __forceinline__ void cmp_hfma2_dot8(half2 & acc, const int4 & a, const int4 & b) {
++    const half2 * ha = reinterpret_cast<const half2 *>(&a);
++    const half2 * hb = reinterpret_cast<const half2 *>(&b);
++    acc = __hfma2(ha[0], hb[0], acc);
++    acc = __hfma2(ha[1], hb[1], acc);
++    acc = __hfma2(ha[2], hb[2], acc);
++    acc = __hfma2(ha[3], hb[3], acc);
++}
++
++// Y[n][m] = sum_k X[n][k] * W[m][k]     (ggml: dst = src0^T . src1)
++// X: [N][K] F16, row stride ldx. W: [M][K] F16 contiguous. Y: [N][M] F32, row stride ldy.
++static __global__ void __launch_bounds__(CMP_NT, 2) mul_mat_cmp_hfma2(
++        const half * __restrict__ X, const int64_t ldx,
++        const half * __restrict__ W,
++        float      * __restrict__ Y, const int64_t ldy,
++        const int N, const int M, const int K) {
++#if __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
++    __shared__ __align__(16) half As[CMP_BM*CMP_LDS];
++    __shared__ __align__(16) half Bs[CMP_BN*CMP_LDS];
++
++    const int     tid = threadIdx.x;
++    const int     m0  = blockIdx.y*CMP_BM;
++    const int64_t n0  = (int64_t) blockIdx.x*CMP_BN;
++    const int     tm  = tid / 32;
++    const int     tn  = tid % 32;
++
++    float acc[CMP_TM][CMP_TN];
++#pragma unroll
++    for (int i = 0; i < CMP_TM; ++i) {
++#pragma unroll
++        for (int j = 0; j < CMP_TN; ++j) {
++            acc[i][j] = 0.0f;
++        }
++    }
++
++    for (int k0 = 0; k0 < K; k0 += CMP_CK) {
++        for (int i = tid; i < CMP_BM*(CMP_CK/8); i += CMP_NT) {
++            const int r = i / (CMP_CK/8);
++            const int c = (i % (CMP_CK/8))*8;
++            int4 v = make_int4(0, 0, 0, 0);
++            if (m0 + r < M && k0 + c < K) {
++                v = *reinterpret_cast<const int4 *>(W + (int64_t)(m0 + r)*K + k0 + c);
++            }
++            *reinterpret_cast<int4 *>(As + r*CMP_LDS + c) = v;
++        }
++        for (int i = tid; i < CMP_BN*(CMP_CK/8); i += CMP_NT) {
++            const int r = i / (CMP_CK/8);
++            const int c = (i % (CMP_CK/8))*8;
++            int4 v = make_int4(0, 0, 0, 0);
++            if (n0 + r < N && k0 + c < K) {
++                v = *reinterpret_cast<const int4 *>(X + (n0 + r)*ldx + k0 + c);
++            }
++            *reinterpret_cast<int4 *>(Bs + r*CMP_LDS + c) = v;
++        }
++        __syncthreads();
++
++        half2 hacc[CMP_TM][CMP_TN];
++#pragma unroll
++        for (int i = 0; i < CMP_TM; ++i) {
++#pragma unroll
++            for (int j = 0; j < CMP_TN; ++j) {
++                hacc[i][j] = __float2half2_rn(0.0f);
++            }
++        }
++#pragma unroll 2
++        for (int c = 0; c < CMP_CK; c += 8) {
++            int4 af[CMP_TM];
++            int4 bf[CMP_TN];
++#pragma unroll
++            for (int i = 0; i < CMP_TM; ++i) {
++                af[i] = *reinterpret_cast<const int4 *>(As + (tm*CMP_TM + i)*CMP_LDS + c);
++            }
++#pragma unroll
++            for (int j = 0; j < CMP_TN; ++j) {
++                bf[j] = *reinterpret_cast<const int4 *>(Bs + (tn + 32*j)*CMP_LDS + c);
++            }
++#pragma unroll
++            for (int i = 0; i < CMP_TM; ++i) {
++#pragma unroll
++                for (int j = 0; j < CMP_TN; ++j) {
++                    cmp_hfma2_dot8(hacc[i][j], af[i], bf[j]);
++                }
++            }
++        }
++        // Leave FP16 every CMP_CK: each half lane has summed only CMP_CK/2 products.
++#pragma unroll
++        for (int i = 0; i < CMP_TM; ++i) {
++#pragma unroll
++            for (int j = 0; j < CMP_TN; ++j) {
++                const float2 f = __half22float2(hacc[i][j]);
++                acc[i][j] += f.x + f.y;
++            }
++        }
++        __syncthreads();
++    }
++
++    // Epilogue: 8 consecutive features per row, two 16 B stores when whole and aligned.
++    const int mb = m0 + tm*CMP_TM;
++#pragma unroll
++    for (int j = 0; j < CMP_TN; ++j) {
++        const int64_t n = n0 + tn + 32*j;
++        if (n >= N) {
++            continue;
++        }
++        float * yrow = Y + n*ldy;
++        if (mb + CMP_TM <= M && ((n*ldy + mb) % 4) == 0) {
++            *reinterpret_cast<float4 *>(yrow + mb)     = make_float4(acc[0][j], acc[1][j], acc[2][j], acc[3][j]);
++            *reinterpret_cast<float4 *>(yrow + mb + 4) = make_float4(acc[4][j], acc[5][j], acc[6][j], acc[7][j]);
++        } else {
++            for (int i = 0; i < CMP_TM && mb + i < M; ++i) {
++                yrow[mb + i] = acc[i][j];
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(X, ldx, W, Y, ldy, N, M, K);
++    NO_DEVICE_CODE;
++#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
++}
++
++static int ggml_cuda_mul_mat_cmp_env() {
++    const char * s = getenv("GGML_CUDA_MMCMP");
++    if (s == nullptr || s[0] == '\0') {
++        return -1; // auto
++    }
++    if (!strcmp(s, "0") || !strcmp(s, "off") || !strcmp(s, "false") || !strcmp(s, "no")) {
++        return 0;
++    }
++    return 1;
++}
++
++} // namespace
++
++bool ggml_cuda_mul_mat_cmp_enabled(int device) {
++    static int  cached[GGML_CUDA_MAX_DEVICES];
++    static bool cached_valid[GGML_CUDA_MAX_DEVICES] = {};
++
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return false;
++    }
++    if (cached_valid[device]) {
++        return cached[device] != 0;
++    }
++
++    const int env = ggml_cuda_mul_mat_cmp_env();
++
++    bool enabled = false;
++    if (env != 0) {
++        const int  cc      = ggml_cuda_info().devices[device].cc;
++        const bool arch_ok = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
++
++        if (env == 1) {
++            enabled = arch_ok;
++            if (!arch_ok) {
++                GGML_LOG_WARN("%s: GGML_CUDA_MMCMP is set but device %d is not an NVIDIA Turing+ device, ignoring\n",
++                    __func__, device);
++            }
++        } else {
++            // Nothing in the device properties distinguishes a throttled mining card from the
++            // GeForce part it is cut from (a CMP 50HX reports compute capability 7.5 like any
++            // TU10x), so detect by name.
++            cudaDeviceProp prop;
++            const int physical_device = ggml_cuda_info().devices[device].physical_device;
++            if (arch_ok && cudaGetDeviceProperties(&prop, physical_device) == cudaSuccess) {
++                enabled = strstr(prop.name, "CMP ") != nullptr;
++                if (enabled) {
++                    GGML_LOG_INFO("%s: detected %s, using the FMA-free HFMA2 matmul "
++                        "(set GGML_CUDA_MMCMP=0 to disable)\n", __func__, prop.name);
++                }
++            }
++        }
++    }
++
++    cached[device]       = enabled ? 1 : 0;
++    cached_valid[device] = true;
++    return enabled;
++}
++
++bool ggml_cuda_mul_mat_cmp_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    GGML_TENSOR_BINARY_OP_LOCALS
++
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // The graph asked for FP32 accumulation (models whose activations overflow FP16).
++    if (dst->op_params[0] == GGML_PREC_F32) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(src0->type) == nullptr) {
++        return false;
++    }
++    // Plain 2D weights; batched/broadcast matmuls (attention without FA, MoE slices) are left alone.
++    if (ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    // Single-token decode is memory bound, not FMA bound; MMVQ/MMVF already serve it.
++    if (ne11 < 8) {
++        return false;
++    }
++    // 128-bit loads along K, 128-bit stores along M.
++    if (ne00 % 8 != 0 || ne01 % 8 != 0) {
++        return false;
++    }
++    // The block tile indexes with int.
++    if (ne00 > INT_MAX || ne01 > INT_MAX || ne11 > INT_MAX) {
++        return false;
++    }
++    return true;
++}
++
++void ggml_cuda_mul_mat_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_TENSOR_BINARY_OP_LOCALS
++
++    cudaStream_t stream = ctx.stream();
++
++    const half * w_ptr = (const half *) src0->data;
++    ggml_cuda_pool_alloc<half> w_alloc(ctx.pool());
++    if (src0->type != GGML_TYPE_F16) {
++        w_alloc.alloc(ggml_nelements(src0));
++        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
++        to_fp16(src0->data, w_alloc.get(), ggml_nelements(src0), stream);
++        w_ptr = w_alloc.get();
++    }
++
++    ggml_cuda_pool_alloc<half> x_alloc(ctx.pool(), ggml_nelements(src1));
++    const to_fp16_cuda_t to_fp16_f32 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
++    to_fp16_f32(src1->data, x_alloc.get(), ggml_nelements(src1), stream);
++
++    const int N = (int) ne11;
++    const int M = (int) ne01;
++    const int K = (int) ne00;
++
++    const dim3 grid((N + CMP_BN - 1)/CMP_BN, (M + CMP_BM - 1)/CMP_BM);
++    mul_mat_cmp_hfma2<<<grid, CMP_NT, 0, stream>>>(
++        x_alloc.get(), K, w_ptr, (float *) dst->data, ne0, N, M, K);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/mmcmp.cuh b/ggml/src/ggml-cuda/mmcmp.cuh
+new file mode 100644
+index 000000000..509094db9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmcmp.cuh
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include "common.cuh"
++
++// ============================================================================
++// Dense matmul for throttled NVIDIA CMP mining cards (Turing, TU10x).
++//
++// CMP 50HX/90HX firmware throttles tensor-core HMMA and FP32 FFMA but leaves
++// packed FP16 (HFMA2) at full rate. Every dense matmul path in ggml-cuda is
++// built on one of the two throttled units: cublasGemmEx (HMMA), MMQ (int8
++// mma), MMF (mma) and the F32 fallbacks (FFMA). This kernel runs the GEMM as
++// "dot-pair" HFMA2 instead: a half2 accumulator holds two partial sums along
++// K, operands are read along K with 128-bit loads, and the half2 partials are
++// flushed into FP32 every CK elements, so FP16 only ever sums 32 products.
++//
++// Quantized weights take the same route as the stock cuBLAS path: dequantize
++// to F16 into a pool buffer, then GEMM. MMQ is bypassed for them.
++//
++// Derived from src/cuda/fp16_linear_hfma2.cu in torch-cmp-patch (cmpext3).
++// ============================================================================
++
++// Whether the CMP matmul is enabled for this device. Tri-state:
++//   GGML_CUDA_MMCMP = 1/on/true/yes  -> force on (NVIDIA Turing+ only)
++//   GGML_CUDA_MMCMP = 0/off/false/no -> force off
++//   unset                            -> auto-detect an NVIDIA "CMP " card
++bool ggml_cuda_mul_mat_cmp_enabled(int device);
++
++// Whether this particular op is one the CMP kernel can handle.
++bool ggml_cuda_mul_mat_cmp_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
