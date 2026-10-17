@@ -217,6 +217,7 @@ ops = _C
 
 from . import autoselect  # noqa: E402  (needs _C imported first)
 from . import fftconv_ops  # noqa: E402  -- pure PyTorch, no optional dependency to gate on
+from . import einsum_ops  # noqa: E402  -- pure PyTorch planner: einsum -> permute/reshape + torch.bmm
 
 _SUPPORTED_DTYPES = (torch.float16, torch.float32, torch.bfloat16)
 _ORIGINALS: dict[tuple[Any, str], Callable] = {}
@@ -428,11 +429,39 @@ def _patched_matmul(input, other, *, out=None):
     if input.dim() == 2 and other.dim() == 2:
         native = lambda: _C.bmm(input.unsqueeze(0), other.unsqueeze(0)).squeeze(0)  # noqa: E731
     elif input.dim() == 3 and other.dim() == 3:
+        if _small_bmm_eligible(input, other):
+            return _dispatch("bmm_small", input, (input.shape, input.dtype, other.shape),
+                             lambda: _small_bmm(input, other), lambda: orig(input, other))
         native = lambda: _C.bmm(input, other)  # noqa: E731
     else:
         return orig(input, other)
     return _dispatch("matmul", input, (input.shape, input.dtype, other.shape),
                      native, lambda: orig(input, other))
+
+
+# Many small matrices (FEM element blocks, small heads): _C.bmm is tiled for big GEMMs and loses badly there
+# (20000 x 24x24 @ 24x3 fp32: 241 ms vs cuBLAS 9.6 ms), and cuBLAS itself is FFMA-throttled. A broadcast
+# multiply + sum reduction uses FMUL/FADD, not FFMA: 0.72 ms for the same case. Chunked over the batch so
+# the (batch, M, K, N) product stays below _SMALL_BMM_CHUNK elements.
+_SMALL_BMM_MAX_MKN = int(os.environ.get("CMPEXT3_SMALL_BMM_MAX_MKN", "32768"))
+_SMALL_BMM_CHUNK = int(os.environ.get("CMPEXT3_SMALL_BMM_CHUNK", str(1 << 25)))
+
+
+def _small_bmm_eligible(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (a.dim() == 3 and b.dim() == 3 and a.size(0) == b.size(0) and a.size(2) == b.size(1)
+            and a.size(1) * a.size(2) * b.size(2) <= _SMALL_BMM_MAX_MKN)
+
+
+def _small_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    n, m, k = a.shape
+    p = b.size(2)
+    step = max(1, _SMALL_BMM_CHUNK // max(m * k * p, 1))
+    if step >= n:
+        return (a.unsqueeze(-1) * b.unsqueeze(1)).sum(2)
+    out = torch.empty((n, m, p), dtype=a.dtype, device=a.device)
+    for s in range(0, n, step):
+        out[s:s + step] = (a[s:s + step].unsqueeze(-1) * b[s:s + step].unsqueeze(1)).sum(2)
+    return out
 
 
 def _patched_bmm(input, mat2, *, out=None):
@@ -441,9 +470,35 @@ def _patched_bmm(input, mat2, *, out=None):
         return orig(input, mat2) if out is None else orig(input, mat2, out=out)
     if input.dtype != mat2.dtype:
         return orig(input, mat2)
+    if _small_bmm_eligible(input, mat2):
+        return _dispatch("bmm_small", input, (input.shape, input.dtype, mat2.shape),
+                         lambda: _small_bmm(input, mat2),
+                         lambda: orig(input, mat2))
     return _dispatch("bmm", input, (input.shape, input.dtype, mat2.shape),
                      lambda: _C.bmm(input, mat2),
                      lambda: orig(input, mat2))
+
+
+def _patched_einsum(*args, **kwargs):
+    """torch.einsum planned as batched matmuls (cmpext3/einsum_ops.py), so the bmm patch -- and with it the
+    FMA-free kernel wherever autoselect keeps it -- applies; stock einsum lowers to cuBLAS bmm in C++ where
+    no Python patch can reach. Measured against stock einsum per equation/shape like every other op."""
+    orig = _ORIGINALS[(torch, "einsum")]
+    if kwargs or len(args) < 2 or not isinstance(args[0], str):
+        return orig(*args, **kwargs)  # sublist format, or an argument we don't know
+    eq = args[0]
+    ops = args[1:]
+    if len(ops) == 1 and isinstance(ops[0], (list, tuple)):
+        ops = tuple(ops[0])
+    if not ops or not all(isinstance(t, torch.Tensor) for t in ops):
+        return orig(*args)
+    if not (_grad_safe(*ops) and _usable(*ops)) or len({t.dtype for t in ops}) != 1:
+        return orig(*args)
+    if einsum_ops.supported(eq, ops) is not None:  # ellipsis, diagonals, ...
+        return orig(*args)
+    return _dispatch("einsum", ops[0], (eq.replace(" ", ""), tuple(tuple(t.shape) for t in ops)),
+                     lambda: einsum_ops.einsum(eq, ops, bmm=torch.bmm),
+                     lambda: orig(*args))
 
 
 def _patched_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
@@ -691,6 +746,7 @@ def enable() -> None:
     _install(F, "linear", _patched_linear)
     _install(torch, "matmul", _patched_matmul)
     _install(torch, "bmm", _patched_bmm)
+    _install(torch, "einsum", _patched_einsum)
     _install(F, "conv2d", _patched_conv2d)
 
     # conv3d, conv_transpose2d and interpolate used to be excluded here
